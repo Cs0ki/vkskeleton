@@ -488,3 +488,16 @@ During Vulkan sessions **I** toggles a free camera (first version used F5). The 
 - **Player frozen** by wrapping `client.so`'s `CL_CreateMove` (also fetched by name): while active, `forwardmove`/`sidemove`/`upmove` (usercmd_t offsets 16/20/24 on i386) are zeroed and the JUMP/DUCK/FORWARD/BACK/MOVELEFT/MOVERIGHT bits cleared from `buttons` (offset 30).
 - **Looking** uses the game's own `viewangles` (the mouse still turns the player). Reading `SDL_GetRelativeMouseState` directly picked up the game's cursor re-centring warps and pinned the camera looking up; removed.
 - The log reports `freecam: V_CalcRefdef hook active` and `CL_CreateMove hook active` once each, `key press seen via X11/SDL` once, and `freecam on/off` on each toggle. Working in-game (toggle on I, flying).
+
+
+### Renderer-side optimizations (round 2)
+
+From the profile after the GPU-transform work (renderer ≈22% of the game thread: `emit_tri` 6%, `push_im_vertex` 5%, `append_geometry`/`mat_mul`/wrappers ~1% each; Mesa GL ≈2%):
+
+1. **GL state shadowing.** While Vulkan presents, tracked state calls (enables of tracked caps, blend/alpha/depth/stencil/colour-mask/polygon-offset, texenv mode and RGB scale, all matrix calls, clip plane, colour/texcoord outside begin/end) are no longer forwarded to Mesa; `glClear` is skipped too (GL's framebuffer is not shown). `gl_skip_state()` marks GL out of sync, and `gl_sync()` → `gl_resync_state()` pushes all tracked state (per-unit texture enable + env, caps, funcs, masks, both matrices, eye-space clip plane, colour, texcoord) before anything really draws through GL (fallback frames, FBO draws, forwarded clears/copies). GL's matrix stack is not mirrored; if shadowing ends between a skipped push and a forwarded pop GL reports a harmless stack underflow.
+2. **Change counters.** `state_serial` (texture binds/creation/deletion/uploads, enables, texenv, blend/alpha/depth/stencil/colour mask, polygon offset) lets `compute_draw_state()` return immediately when nothing changed; `xform_serial` (matrix calls, depth range, clip plane, enable/disable) plus `frame_epoch` (frame matrix table reset) let a draw reuse the previous MVP multiply and `frame_mats[]` entry.
+3. **Indexed drawing.** Each draw copies its vertices once into the frame's vertex region (`cur_draw_base`); triangulation writes 32-bit indices into a per-slot index buffer (`FRAME_MAX_INDICES` = 2 × vertex budget); batches are index ranges drawn with `vkCmdDrawIndexed`. Strips/fans no longer write most vertices three times.
+4. **Optional render thread** (`VKSKELETON_RENDER_THREAD=1`, off by default). Frame command lists, batches and matrix tables are now per slot. At swap the game thread snapshots the frame (`rec_*`: slot, command list, batches, matrices, vertex count, clear colour, ended upload batch), advances to the next slot and either runs the render side in place (default) or hands it to the worker (`begin_frame` → `record_frame_vertices` → `end_frame_present`). One job in flight at a time; texture destruction, descriptor rewrites and `wait_texture_idle()` first wait for the worker to be idle; `queue_mtx` guards submit/present/device-wait. Not yet run in-game.
+5. **Build:** `-O3` (PIC kept: `-fno-pic` would add text relocations).
+
+All five built; not yet run in-game.

@@ -37,7 +37,7 @@ fi
 # can be used for the -m32 build without installing gcc-multilib headers.
 # SSE2 instead of the i386 default x87 FPU (perf: x87 float copies dominated
 # the per-vertex path).
-gcc -m32 -O2 -msse2 -mfpmath=sse -fPIC -Wall -Wno-missing-braces \
+gcc -m32 -O3 -msse2 -mfpmath=sse -fPIC -Wall -Wno-missing-braces \
     -Isrc -Isrc/compat -I/usr/include/x86_64-linux-gnu \
     -c src/vkskeleton.c -o build/vkskeleton.o
 ld -m elf_i386 -shared -o build/vkskeleton.so build/vkskeleton.o \

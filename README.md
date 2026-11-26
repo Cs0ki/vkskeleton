@@ -26,9 +26,10 @@ Not affiliated with or endorsed by the Sven Co-op team or Valve.
 - **Mirrors**: framebuffer→texture copies (`glCopyTexSubImage2D`), mid-frame
   clears, stencil, user clip planes.
 - **Decals** without z-fighting (`glPolygonOffset` → depth bias).
-- **Performance**: no duplicate GL rendering, two frames in flight, batched
-  texture uploads, vertex transform and clipping on the GPU, keyed pipeline
-  cache, SSE2 build.
+- **Performance**: no duplicate GL rendering or GL state forwarding, two
+  frames in flight, batched texture uploads, vertex transform and clipping on
+  the GPU, indexed drawing, cached draw state, keyed pipeline cache,
+  SSE2/`-O3` build, optional render thread.
 - **Window resize** (swapchain rebuild), `MAILBOX` presentation when available.
 - **Freecam**: press **I** to fly the camera (see *Controls*).
 - Options → Video → Renderer reads **"Vulkan"** during Vulkan sessions.
@@ -77,6 +78,7 @@ stock OpenGL renderer.
 | `SVEN_DIR` | game folder, if not found automatically |
 | `VKSKELETON_PRESENT_MODE` | `mailbox`, `immediate` or `fifo` (default: best available, `mailbox` preferred) |
 | `VKSKELETON_GL_PASSTHROUGH=1` | also send draws to OpenGL (slower; for debugging) |
+| `VKSKELETON_RENDER_THREAD=1` | **experimental**: record/submit/present Vulkan frames on a separate thread |
 | `VKSKELETON_DEBUG=1` | extra one-shot logging of GL state events |
 
 Logs: `/tmp/vkplay.log.<pid>` (renderer) and `/tmp/vk-play-stdout.log` (game).

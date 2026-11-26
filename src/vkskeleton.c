@@ -25,6 +25,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <pthread.h>
 
 #include "shaders_spirv.h"
 
@@ -187,6 +188,11 @@ static VkCommandBuffer cmd_buffers[16];
 static VkBuffer vertex_buffer;
 static VkDeviceMemory vertex_memory;
 static void *vertex_map;
+/* Index buffer: vertices are written once per draw and triangles reference
+ * them by index (strips/fans used to be expanded, writing most vertices 3x). */
+static VkBuffer index_buffer;
+static VkDeviceMemory index_memory;
+static void *index_map;
 static VkDescriptorSetLayout descriptor_layout;
 static VkDescriptorPool descriptor_pool;
 static VkSampler texture_sampler;
@@ -310,6 +316,11 @@ static void note_frame_overflow(void)
 }
 #define IMMEDIATE_MAX_VERTICES 65536
 #define FRAME_VERTEX_BYTES ((VkDeviceSize)FRAME_MAX_VERTICES * sizeof(vk_vertex_t))
+#define FRAME_MAX_INDICES (FRAME_MAX_VERTICES * 2)
+#define FRAME_INDEX_BYTES ((VkDeviceSize)FRAME_MAX_INDICES * sizeof(uint32_t))
+static uint32_t *frame_indices;   /* this slot's region of index_buffer */
+static size_t frame_index_count;
+static uint32_t cur_draw_base;    /* first vertex of the current draw */
 /* Points into this frame slot's region of the mapped vertex buffer; triangles
  * are written there directly (no CPU staging array + per-frame memcpy). */
 static vk_vertex_t *frame_vertices;
@@ -324,11 +335,13 @@ typedef struct {
     float bias_s, bias_c;   /* depth bias slope/constant (dynamic state) */
 } frame_batch_t;
 #define MAX_FRAME_MATS 65536
-static float frame_mats[MAX_FRAME_MATS][20]; /* mvp + clip plane */
+static float frame_mats_store[FRAMES_IN_FLIGHT][MAX_FRAME_MATS][20];
+static float (*frame_mats)[20] = frame_mats_store[0]; /* mvp + clip plane */
 static uint32_t frame_mat_count;
 static uint32_t cur_draw_mat;
 #define MAX_FRAME_BATCHES 65536
-static frame_batch_t frame_batches[MAX_FRAME_BATCHES];
+static frame_batch_t frame_batches_store[FRAMES_IN_FLIGHT][MAX_FRAME_BATCHES];
+static frame_batch_t *frame_batches = frame_batches_store[0];
 static uint32_t frame_batch_count;
 static size_t frame_vertex_count;
 static vk_texture_t vk_textures[MAX_VK_TEXTURES];
@@ -403,11 +416,50 @@ typedef struct {
     int32_t dx, dy, sx, sy, w, h; /* COPY: GL-space rectangle */
 } frame_cmd_t;
 #define MAX_FRAME_CMDS 65536
-static frame_cmd_t frame_cmds[MAX_FRAME_CMDS];
+static frame_cmd_t frame_cmds_store[FRAMES_IN_FLIGHT][MAX_FRAME_CMDS];
+static frame_cmd_t *frame_cmds = frame_cmds_store[0];
 static uint32_t frame_cmd_count;
+/* Snapshot of a finished frame for the render side (begin_frame,
+ * record_frame_vertices, end_frame_present): taken by the game thread at
+ * swap time, consumed synchronously or by the render thread. */
+static uint32_t rec_slot;
+static frame_cmd_t *rec_cmds;
+static uint32_t rec_cmd_count;
+static frame_batch_t *rec_batches;
+static float (*rec_mats)[20];
+static size_t rec_vertex_count;
+static int rec_has_upload;
+static float rec_clear_color[4];
+/* Opt-in render thread (VKSKELETON_RENDER_THREAD=1). */
+static int render_thread_enabled;
+static pthread_t render_thread;
+static int render_thread_started;
+static pthread_mutex_t rt_mtx = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t rt_job_cv = PTHREAD_COND_INITIALIZER;
+static pthread_cond_t rt_done_cv = PTHREAD_COND_INITIALIZER;
+static int rt_job_pending, rt_busy;
+/* Guards vkQueueSubmit / vkQueuePresentKHR / vkDeviceWaitIdle, which the
+ * render thread and the game thread (sync upload flushes) both use. */
+static pthread_mutex_t queue_mtx = PTHREAD_MUTEX_INITIALIZER;
+static void render_thread_wait_idle(void);
 static VkRenderPass render_pass_load; /* LOAD variant to resume after a copy */
 static int swap_can_copy;             /* swapchain has TRANSFER_SRC usage */
 static int color_mask_off;            /* glColorMask(0,0,0,0): stencil-only */
+/* Change counters: draws reuse the previous draw's resolved state / matrix
+ * when nothing affecting it changed (the common case across thousands of
+ * model strips per frame). */
+static unsigned state_serial = 1;     /* texture/blend/depth/stencil/... */
+/* While Vulkan presents, tracked GL state calls are not forwarded to OpenGL
+ * (it renders nothing then).  gl_out_of_sync records that; gl_sync() pushes
+ * all tracked state into GL before anything really draws through it. */
+static int gl_out_of_sync;
+static GLboolean color_mask_rgba[4] = {1, 1, 1, 1};
+static GLuint st_mask = 0xff;
+static int gl_skip_state(void);
+static void gl_sync(void);
+static int should_skip_gl_draw(void);
+static unsigned xform_serial = 1;     /* matrices, depth range, clip plane */
+static unsigned frame_epoch = 1;      /* bumped whenever frame_mats[] resets */
 /* Depth/stencil GL state, folded into the pipeline key of each draw. */
 static int stencil_test_enabled;
 static GLenum st_func = GL_ALWAYS;
@@ -498,6 +550,8 @@ PFN(CmdEndRenderPass);
 PFN(CmdBindPipeline);
 PFN(CmdBindDescriptorSets);
 PFN(CmdBindVertexBuffers);
+PFN(CmdBindIndexBuffer);
+PFN(CmdDrawIndexed);
 PFN(CmdDraw);
 PFN(EndCommandBuffer);
 PFN(CreateSemaphore);
@@ -943,6 +997,8 @@ static uint32_t find_memory_type(VkMemoryRequirements req,
  * while a pending command buffer uses them). */
 static void wait_texture_idle(const vk_texture_t *tex)
 {
+    if (render_thread_enabled)
+        render_thread_wait_idle();
     if (!device || !tex || tex->last_used_serial <= completed_serial)
         return;
     p_vkWaitForFences(device, FRAMES_IN_FLIGHT, frame_fences, VK_TRUE,
@@ -952,6 +1008,9 @@ static void wait_texture_idle(const vk_texture_t *tex)
 
 static void destroy_texture_image(vk_texture_t *tex)
 {
+    if (render_thread_enabled)
+        render_thread_wait_idle();
+    state_serial++;
     if (tex->image && upload_recording)
         flush_uploads_sync();
     wait_texture_idle(tex);
@@ -1036,6 +1095,8 @@ static VkSampler sampler_for_texture(const vk_texture_t *tex)
 
 static void refresh_texture_descriptor(vk_texture_t *tex)
 {
+    if (render_thread_enabled && tex && tex->desc_set)
+        render_thread_wait_idle();
     VkDescriptorImageInfo image_info = {0};
     VkWriteDescriptorSet write = {0};
 
@@ -1132,6 +1193,7 @@ static int upload_batch_begin(void)
 static void flush_uploads_sync(void)
 {
     VkSubmitInfo si = {0};
+    VkResult r;
 
     if (!upload_recording)
         return;
@@ -1141,7 +1203,10 @@ static void flush_uploads_sync(void)
     si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
     si.commandBufferCount = 1;
     si.pCommandBuffers = &upload_cmds[cur_frame];
-    if (p_vkQueueSubmit(queue, 1, &si, upload_fence) != VK_SUCCESS) {
+    pthread_mutex_lock(&queue_mtx);
+    r = p_vkQueueSubmit(queue, 1, &si, upload_fence);
+    pthread_mutex_unlock(&queue_mtx);
+    if (r != VK_SUCCESS) {
         logmsg("vkskeleton: upload flush submit failed\n");
         return;
     }
@@ -1153,6 +1218,7 @@ static void upload_texture_pixels(vk_texture_t *tex, uint32_t xoff,
                                   uint32_t yoff, uint32_t w, uint32_t h,
                                   const unsigned char *pixels, int src_bpp)
 {
+    state_serial++;
     VkBufferImageCopy copy = {0};
     VkImageLayout old_layout;
     const unsigned char *src;
@@ -1264,6 +1330,7 @@ static int create_vk_texture_image(vk_texture_t *tex, uint32_t width,
                                    uint32_t height, const void *pixels,
                                    int src_bpp)
 {
+    state_serial++;
     VkImageCreateInfo image_ci = {0};
     VkMemoryRequirements mem_req;
     VkMemoryAllocateInfo alloc = {0};
@@ -1761,6 +1828,29 @@ static int create_graphics_resources(void)
     }
     logmsg("vkskeleton: vertex buffer ready\n");
 
+    bci.size = FRAME_INDEX_BYTES * FRAMES_IN_FLIGHT;
+    bci.usage = VK_BUFFER_USAGE_INDEX_BUFFER_BIT;
+    r = p_vkCreateBuffer(device, &bci, NULL, &index_buffer);
+    if (r != VK_SUCCESS) {
+        logf_msg("vkskeleton: index CreateBuffer failed (%d)\n", (int)r);
+        return 0;
+    }
+    p_vkGetBufferMemoryRequirements(device, index_buffer, &mem_req);
+    mai.allocationSize = mem_req.size;
+    mai.memoryTypeIndex =
+        find_memory_type(mem_req, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                                      VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    if (mai.memoryTypeIndex == ~0u ||
+        p_vkAllocateMemory(device, &mai, NULL, &index_memory) != VK_SUCCESS ||
+        p_vkBindBufferMemory(device, index_buffer, index_memory, 0) !=
+            VK_SUCCESS ||
+        p_vkMapMemory(device, index_memory, 0, mem_req.size, 0, &index_map) !=
+            VK_SUCCESS) {
+        logmsg("vkskeleton: index buffer memory failed\n");
+        return 0;
+    }
+    logmsg("vkskeleton: index buffer ready\n");
+
     logmsg("vkskeleton: graphics resources ready\n");
     return 1;
 }
@@ -1916,7 +2006,9 @@ static int recreate_swapchain(void)
 {
     int rc;
 
+    pthread_mutex_lock(&queue_mtx);
     p_vkDeviceWaitIdle(device);
+    pthread_mutex_unlock(&queue_mtx);
     completed_serial = frame_serial;
     destroy_swap_resources();
     rc = create_swapchain();
@@ -2143,6 +2235,8 @@ static int init_vulkan(Display *dpy, Window win)
     LOAD_DEVICE(CmdBindPipeline);
     LOAD_DEVICE(CmdBindDescriptorSets);
     LOAD_DEVICE(CmdBindVertexBuffers);
+    LOAD_DEVICE(CmdBindIndexBuffer);
+    LOAD_DEVICE(CmdDrawIndexed);
     LOAD_DEVICE(CmdDraw);
     LOAD_DEVICE(EndCommandBuffer);
     LOAD_DEVICE(CreateSemaphore);
@@ -2293,19 +2387,19 @@ static int begin_frame(void)
         return 0;
 
     /* Reuse this slot only once the GPU has finished its previous frame. */
-    p_vkWaitForFences(device, 1, &frame_fences[cur_frame], VK_TRUE, UINT64_MAX);
-    if (frame_slot_serial[cur_frame] > completed_serial)
-        completed_serial = frame_slot_serial[cur_frame];
+    p_vkWaitForFences(device, 1, &frame_fences[rec_slot], VK_TRUE, UINT64_MAX);
+    if (frame_slot_serial[rec_slot] > completed_serial)
+        completed_serial = frame_slot_serial[rec_slot];
 
     r = p_vkAcquireNextImageKHR(device, swapchain, UINT64_MAX,
-                                acquire_sems[cur_frame], VK_NULL_HANDLE,
+                                acquire_sems[rec_slot], VK_NULL_HANDLE,
                                 &current_image);
     if (r == VK_ERROR_OUT_OF_DATE_KHR) {
         /* Resized between frames: rebuild now and retry once. */
         if (recreate_swapchain() <= 0)
             return 0;
         r = p_vkAcquireNextImageKHR(device, swapchain, UINT64_MAX,
-                                    acquire_sems[cur_frame], VK_NULL_HANDLE,
+                                    acquire_sems[rec_slot], VK_NULL_HANDLE,
                                     &current_image);
     }
     if (r == VK_SUBOPTIMAL_KHR) {
@@ -2318,8 +2412,8 @@ static int begin_frame(void)
         return 0;
     }
 
-    p_vkResetFences(device, 1, &frame_fences[cur_frame]);
-    p_vkBeginCommandBuffer(cmd_buffers[cur_frame],
+    p_vkResetFences(device, 1, &frame_fences[rec_slot]);
+    p_vkBeginCommandBuffer(cmd_buffers[rec_slot],
                            &(VkCommandBufferBeginInfo){
                                .sType =
                                    VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
@@ -2327,10 +2421,10 @@ static int begin_frame(void)
                                    VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
                            });
 
-    clear_values[0].color.float32[0] = clear_color[0];
-    clear_values[0].color.float32[1] = clear_color[1];
-    clear_values[0].color.float32[2] = clear_color[2];
-    clear_values[0].color.float32[3] = clear_color[3];
+    clear_values[0].color.float32[0] = rec_clear_color[0];
+    clear_values[0].color.float32[1] = rec_clear_color[1];
+    clear_values[0].color.float32[2] = rec_clear_color[2];
+    clear_values[0].color.float32[3] = rec_clear_color[3];
     clear_values[1].depthStencil.depth = 1.0f;
     clear_values[1].depthStencil.stencil = 0;
     rpbi.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
@@ -2341,7 +2435,7 @@ static int begin_frame(void)
     rpbi.renderArea.extent = swap_extent;
     rpbi.clearValueCount = 2;
     rpbi.pClearValues = clear_values;
-    p_vkCmdBeginRenderPass(cmd_buffers[cur_frame], &rpbi,
+    p_vkCmdBeginRenderPass(cmd_buffers[rec_slot], &rpbi,
                            VK_SUBPASS_CONTENTS_INLINE);
     {
         VkViewport vp = {0};
@@ -2350,8 +2444,8 @@ static int begin_frame(void)
         vp.height = (float)swap_extent.height;
         vp.maxDepth = 1.0f;
         sc.extent = swap_extent;
-        p_vkCmdSetViewport(cmd_buffers[cur_frame], 0, 1, &vp);
-        p_vkCmdSetScissor(cmd_buffers[cur_frame], 0, 1, &sc);
+        p_vkCmdSetViewport(cmd_buffers[rec_slot], 0, 1, &vp);
+        p_vkCmdSetScissor(cmd_buffers[rec_slot], 0, 1, &sc);
     }
     frame_active = 1;
     return 1;
@@ -2712,37 +2806,40 @@ static void record_frame_vertices(void)
     uint32_t slot;
     int k;
 
-    if (!frame_active || !frame_cmd_count || !vertex_map || !frame_slot_ready)
+    if (!frame_active || !rec_cmd_count || !vertex_map)
         return;
     (void)bytes;
     (void)j;
-    offset = (VkDeviceSize)cur_frame * FRAME_VERTEX_BYTES;
+    offset = (VkDeviceSize)rec_slot * FRAME_VERTEX_BYTES;
 
     if (!logged_first_draw) {
         logged_first_draw = 1;
         logf_msg("vkskeleton: first Vulkan draw (%u vertices)\n",
-                 (unsigned)frame_vertex_count);
+                 (unsigned)rec_vertex_count);
     }
     for (k = 0; k < logged_draw_size_count; k++) {
-        if (logged_draw_sizes[k] == (int)frame_vertex_count)
+        if (logged_draw_sizes[k] == (int)rec_vertex_count)
             break;
     }
     if (k == logged_draw_size_count && logged_draw_size_count < 16) {
-        logged_draw_sizes[logged_draw_size_count++] = (int)frame_vertex_count;
+        logged_draw_sizes[logged_draw_size_count++] = (int)rec_vertex_count;
         logf_msg("vkskeleton: Vulkan draw size %u vertices\n",
-                 (unsigned)frame_vertex_count);
+                 (unsigned)rec_vertex_count);
     }
 
-    p_vkCmdBindVertexBuffers(cmd_buffers[cur_frame], 0, 1, &vertex_buffer,
+    p_vkCmdBindVertexBuffers(cmd_buffers[rec_slot], 0, 1, &vertex_buffer,
                              &offset);
+    p_vkCmdBindIndexBuffer(cmd_buffers[rec_slot], index_buffer,
+                           (VkDeviceSize)rec_slot * FRAME_INDEX_BYTES,
+                           VK_INDEX_TYPE_UINT32);
 
     {
-        VkCommandBuffer cb = cmd_buffers[cur_frame];
+        VkCommandBuffer cb = cmd_buffers[rec_slot];
         uint32_t last_mat = ~0u;
         uint32_t ci;
 
-        for (ci = 0; ci < frame_cmd_count; ci++) {
-            const frame_cmd_t *c = &frame_cmds[ci];
+        for (ci = 0; ci < rec_cmd_count; ci++) {
+            const frame_cmd_t *c = &rec_cmds[ci];
 
             if (c->type == FCMD_CLEAR) {
                 VkClearAttachment ca[2];
@@ -2774,18 +2871,22 @@ static void record_frame_vertices(void)
                 record_framebuffer_copy(cb, c);
                 /* new render pass: rebind everything */
                 p_vkCmdBindVertexBuffers(cb, 0, 1, &vertex_buffer, &offset);
+                p_vkCmdBindIndexBuffer(cb, index_buffer,
+                                       (VkDeviceSize)rec_slot *
+                                           FRAME_INDEX_BYTES,
+                                       VK_INDEX_TYPE_UINT32);
                 last_mat = ~0u;
                 continue;
             }
             {
-                const frame_batch_t *b = &frame_batches[c->a];
+                const frame_batch_t *b = &rec_batches[c->a];
                 VkDescriptorSet sets[2];
                 uint32_t slot2 = b->tex2;
 
                 if (b->mat != last_mat) {
                     p_vkCmdPushConstants(cb, pipeline_layout,
                                          VK_SHADER_STAGE_VERTEX_BIT, 0, 80,
-                                         frame_mats[b->mat]);
+                                         rec_mats[b->mat]);
                     last_mat = b->mat;
                 }
                 slot = b->tex;
@@ -2812,7 +2913,7 @@ static void record_frame_vertices(void)
                     p_vkCmdSetDepthBias(cb, b->bias_c, 0.0f, b->bias_s);
                 p_vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS,
                                           pipeline_layout, 0, 2, sets, 0, NULL);
-                p_vkCmdDraw(cb, b->count, 1, b->first, 0);
+                p_vkCmdDrawIndexed(cb, b->count, 1, b->first, 0, 0);
             }
         }
     }
@@ -2829,34 +2930,33 @@ static int end_frame_present(void)
     if (!frame_active)
         return 0;
 
-    p_vkCmdEndRenderPass(cmd_buffers[cur_frame]);
-    p_vkEndCommandBuffer(cmd_buffers[cur_frame]);
+    p_vkCmdEndRenderPass(cmd_buffers[rec_slot]);
+    p_vkEndCommandBuffer(cmd_buffers[rec_slot]);
 
     si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
     si.waitSemaphoreCount = 1;
-    si.pWaitSemaphores = &acquire_sems[cur_frame];
+    si.pWaitSemaphores = &acquire_sems[rec_slot];
     si.pWaitDstStageMask = &wait_stage;
     {
         static VkCommandBuffer cbs[2];
         uint32_t n = 0;
-        if (upload_recording) {
-            p_vkEndCommandBuffer(upload_cmds[cur_frame]);
-            upload_recording = 0;
-            cbs[n++] = upload_cmds[cur_frame];
-        }
-        cbs[n++] = cmd_buffers[cur_frame];
+        if (rec_has_upload) /* ended by the game thread at snapshot time */
+            cbs[n++] = upload_cmds[rec_slot];
+        cbs[n++] = cmd_buffers[rec_slot];
         si.commandBufferCount = n;
         si.pCommandBuffers = cbs;
     }
     si.signalSemaphoreCount = 1;
     si.pSignalSemaphores = &render_sems[current_image];
-    r = p_vkQueueSubmit(queue, 1, &si, frame_fences[cur_frame]);
+    pthread_mutex_lock(&queue_mtx);
+    r = p_vkQueueSubmit(queue, 1, &si, frame_fences[rec_slot]);
+    pthread_mutex_unlock(&queue_mtx);
     if (r != VK_SUCCESS) {
         logf_msg("vkskeleton: QueueSubmit failed (%d)\n", (int)r);
         frame_active = 0;
         return 0;
     }
-    frame_slot_serial[cur_frame] = ++frame_serial;
+    frame_slot_serial[rec_slot] = ++frame_serial;
     /* No wait here: the next begin_frame waits only for the slot it reuses. */
 
     pi.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
@@ -2865,7 +2965,9 @@ static int end_frame_present(void)
     pi.swapchainCount = 1;
     pi.pSwapchains = &swapchain;
     pi.pImageIndices = &current_image;
+    pthread_mutex_lock(&queue_mtx);
     r = p_vkQueuePresentKHR(queue, &pi);
+    pthread_mutex_unlock(&queue_mtx);
     if (r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_SUBOPTIMAL_KHR)
         swapchain_needs_rebuild = 1;
     else if (r != VK_SUCCESS)
@@ -2875,14 +2977,7 @@ static int end_frame_present(void)
         logmsg("vkskeleton: first Vulkan present\n");
     }
 
-    cur_frame = (cur_frame + 1) % FRAMES_IN_FLIGHT;
-    frame_slot_ready = 0;
-    frame_batch_count = 0;
-    frame_cmd_count = 0;
-    frame_mat_count = 0;
     frame_active = 0;
-    frame_vertex_count = 0;
-    frame_has_clear = 0;
     return 1;
 }
 
@@ -2901,12 +2996,21 @@ static int frame_slot_begin(void)
     if (!vertex_map || !device)
         return 0;
     p_vkWaitForFences(device, 1, &frame_fences[cur_frame], VK_TRUE, UINT64_MAX);
+    if (!index_map)
+        return 0;
+    frame_cmds = frame_cmds_store[cur_frame];
+    frame_batches = frame_batches_store[cur_frame];
+    frame_mats = frame_mats_store[cur_frame];
     frame_vertices = (vk_vertex_t *)((char *)vertex_map +
                                      (size_t)cur_frame * FRAME_VERTEX_BYTES);
+    frame_indices = (uint32_t *)((char *)index_map +
+                                 (size_t)cur_frame * FRAME_INDEX_BYTES);
     frame_vertex_count = 0;
+    frame_index_count = 0;
     frame_batch_count = 0;
     frame_cmd_count = 0;
     frame_mat_count = 0;
+    frame_epoch++;
     frame_slot_ready = 1;
     return 1;
 }
@@ -2920,7 +3024,7 @@ static void batch_add_tri(const im_vertex_t *s)
         b->pkey == cur_draw_pkey && b->sref == cur_draw_sref &&
         b->bias_s == cur_draw_bias_s && b->bias_c == cur_draw_bias_c &&
         b->mat == cur_draw_mat &&
-        b->first + b->count == frame_vertex_count && frame_cmd_count &&
+        b->first + b->count == frame_index_count && frame_cmd_count &&
         frame_cmds[frame_cmd_count - 1].type == FCMD_DRAW &&
         frame_cmds[frame_cmd_count - 1].a == frame_batch_count - 1) {
         b->count += 3;
@@ -2930,7 +3034,7 @@ static void batch_add_tri(const im_vertex_t *s)
         frame_cmds[frame_cmd_count].a = frame_batch_count;
         frame_cmd_count++;
         b = &frame_batches[frame_batch_count++];
-        b->first = (uint32_t)frame_vertex_count;
+        b->first = (uint32_t)frame_index_count;
         b->count = 3;
         b->tex = s->tex;
         b->tex2 = s->tex2;
@@ -2942,7 +3046,7 @@ static void batch_add_tri(const im_vertex_t *s)
     } else {
         return; /* batch table full: drop (logged as overflow) */
     }
-    frame_vertex_count += 3;
+    frame_index_count += 3;
 }
 
 /* GL clip space -> Vulkan clip space, folded into the draw's matrix:
@@ -3005,19 +3109,18 @@ _Static_assert(offsetof(im_vertex_t, x) == offsetof(vk_vertex_t, x) &&
  * shader applies the draw's matrix and the GPU clips and divides. */
 static void emit_tri(size_t ia, size_t ib, size_t ic)
 {
-    vk_vertex_t *dst;
+    uint32_t *dst;
 
-    if (frame_vertex_count + 3 > FRAME_MAX_VERTICES ||
+    if (frame_index_count + 3 > FRAME_MAX_INDICES ||
         frame_batch_count >= MAX_FRAME_BATCHES) {
         note_frame_overflow();
         return;
     }
-    /* three sequential 52-byte block copies into (write-combined)
-     * GPU-visible memory */
-    dst = &frame_vertices[frame_vertex_count];
-    memcpy(&dst[0], &im_vertices[ia], sizeof(vk_vertex_t));
-    memcpy(&dst[1], &im_vertices[ib], sizeof(vk_vertex_t));
-    memcpy(&dst[2], &im_vertices[ic], sizeof(vk_vertex_t));
+    /* the draw's vertices were already copied once (append_geometry) */
+    dst = &frame_indices[frame_index_count];
+    dst[0] = cur_draw_base + (uint32_t)ia;
+    dst[1] = cur_draw_base + (uint32_t)ib;
+    dst[2] = cur_draw_base + (uint32_t)ic;
     batch_add_tri(&im_vertices[ia]);
 }
 
@@ -3037,14 +3140,33 @@ static void append_geometry(void)
         dbg_event("draw colormask off (stencil-only) prim=0x%x n=%u st=%d "
                   "func=0x%x ref=%d", im_mode, (unsigned)im_vertex_count,
                   stencil_test_enabled, st_func, st_ref);
-    mat_mul(&mat_mvp, &mat_proj, &mat_model);
     if (!frame_slot_begin())
         return;
-    cur_draw_mat = frame_matrix_for_draw();
+    {
+        static unsigned done_xform, done_epoch;
+        if (done_xform != xform_serial || done_epoch != frame_epoch ||
+            cur_draw_mat == ~0u) {
+            mat_mul(&mat_mvp, &mat_proj, &mat_model);
+            cur_draw_mat = frame_matrix_for_draw();
+            done_xform = xform_serial;
+            done_epoch = frame_epoch;
+        }
+    }
     if (cur_draw_mat == ~0u) {
         note_frame_overflow();
         return;
     }
+    if (frame_vertex_count + im_vertex_count > FRAME_MAX_VERTICES) {
+        note_frame_overflow();
+        return;
+    }
+    /* im_vertex_t begins with vk_vertex_t's exact layout: one block copy per
+     * vertex into (write-combined) GPU-visible memory. */
+    cur_draw_base = (uint32_t)frame_vertex_count;
+    for (i = 0; i < im_vertex_count; i++)
+        memcpy(&frame_vertices[frame_vertex_count + i], &im_vertices[i],
+               sizeof(vk_vertex_t));
+    frame_vertex_count += im_vertex_count;
 
     switch (im_mode) {
     case GL_TRIANGLES:
@@ -3106,7 +3228,12 @@ static struct {
 
 static void compute_draw_state(void)
 {
+    static unsigned done_serial;
     vk_texture_t *tex;
+
+    if (done_serial == state_serial)
+        return; /* nothing changed since the previous draw */
+    done_serial = state_serial;
 
     ds.tex = ds.tex2 = 0;
     ds.scale = 1.0f;
@@ -3293,8 +3420,11 @@ void glClear(GLbitfield mask)
         c->mask = mask;
         memcpy(c->color, clear_color, sizeof(c->color));
     }
-    if (real_gl_clear)
+    /* GL's framebuffer is not shown while Vulkan presents */
+    if (real_gl_clear && !(geometry_enabled && should_skip_gl_draw())) {
+        gl_sync();
         real_gl_clear(mask);
+    }
 }
 
 #ifndef VKSKELETON_NO_GEOMETRY_WRAPPERS
@@ -3305,6 +3435,25 @@ void glClear(GLbitfield mask)
 static int should_skip_gl_draw(void)
 {
     return skip_gl_draws && ready && !swapchain_dead && current_framebuffer == 0;
+}
+
+/* Tracked state calls are skipped while Vulkan presents; GL is resynced by
+ * gl_sync() before it really draws (fallback frames, FBO draws, copies). */
+static int gl_skip_state(void)
+{
+    if (geometry_enabled && skip_gl_draws && ready && !swapchain_dead) {
+        gl_out_of_sync = 1;
+        return 1;
+    }
+    return 0;
+}
+
+static int tracked_cap(GLenum cap)
+{
+    return cap == GL_TEXTURE_2D || cap == GL_BLEND || cap == GL_DEPTH_TEST ||
+           cap == 0xbc0 /* ALPHA_TEST */ || cap == 0xb90 /* STENCIL_TEST */ ||
+           cap == 0x8037 /* POLYGON_OFFSET_FILL */ ||
+           cap == 0x3000 /* CLIP_PLANE0 */;
 }
 
 void glBegin(GLenum mode)
@@ -3318,8 +3467,10 @@ void glBegin(GLenum mode)
         compute_draw_state();
     }
     im_skip_gl = geometry_enabled && should_skip_gl_draw();
-    if (real_gl_begin && !im_skip_gl)
+    if (real_gl_begin && !im_skip_gl) {
+        gl_sync();
         real_gl_begin(mode);
+    }
 }
 
 void glEnd(void)
@@ -3328,24 +3479,6 @@ void glEnd(void)
         real_gl_end = (fn_gl_end)next_symbol("glEnd");
     if (real_gl_end && !im_skip_gl)
         real_gl_end();
-    if (im_skip_gl) {
-        /* Per-vertex colour/texcoord calls were not forwarded inside this
-         * skipped begin/end; hand GL the final current values once so its
-         * state matches what the game expects for later GL draws. */
-        if (!real_gl_color4f)
-            real_gl_color4f = (fn_gl_color4f)next_symbol("glColor4f");
-        if (!real_gl_texcoord2f)
-            real_gl_texcoord2f = (fn_gl_texcoord2f)next_symbol("glTexCoord2f");
-        if (real_gl_color4f)
-            real_gl_color4f(cur_color[0], cur_color[1], cur_color[2],
-                            cur_color[3]);
-        if (real_gl_texcoord2f)
-            real_gl_texcoord2f(cur_u, cur_v);
-        if (real_gl_multi_texcoord2f_arb)
-            real_gl_multi_texcoord2f_arb(GL_TEXTURE0_ENUM + 1, cur_u2, cur_v2);
-        else if (real_gl_multi_texcoord2f)
-            real_gl_multi_texcoord2f(GL_TEXTURE0_ENUM + 1, cur_u2, cur_v2);
-    }
     im_skip_gl = 0;
     if (geometry_enabled) {
         append_geometry();
@@ -3399,7 +3532,7 @@ void glTexCoord2f(GLfloat s, GLfloat t)
         cur_u = s;
         cur_v = t;
     }
-    if (real_gl_texcoord2f && !im_skip_gl)
+    if (real_gl_texcoord2f && !im_skip_gl && !gl_skip_state())
         real_gl_texcoord2f(s, t);
 }
 
@@ -3413,7 +3546,7 @@ void glColor3f(GLfloat r, GLfloat g, GLfloat b)
         cur_color[2] = b;
         cur_color[3] = 1.0f;
     }
-    if (real_gl_color3f && !im_skip_gl)
+    if (real_gl_color3f && !im_skip_gl && !gl_skip_state())
         real_gl_color3f(r, g, b);
 }
 
@@ -3427,7 +3560,7 @@ void glColor4f(GLfloat r, GLfloat g, GLfloat b, GLfloat a)
         cur_color[2] = b;
         cur_color[3] = a;
     }
-    if (real_gl_color4f && !im_skip_gl)
+    if (real_gl_color4f && !im_skip_gl && !gl_skip_state())
         real_gl_color4f(r, g, b, a);
 }
 
@@ -3441,7 +3574,7 @@ void glColor3ubv(const GLubyte *v)
         cur_color[2] = v[2] / 255.0f;
         cur_color[3] = 1.0f;
     }
-    if (real_gl_color3ubv && !im_skip_gl)
+    if (real_gl_color3ubv && !im_skip_gl && !gl_skip_state())
         real_gl_color3ubv(v);
 }
 
@@ -3455,7 +3588,7 @@ void glColor4ub(GLubyte r, GLubyte g, GLubyte b, GLubyte a)
         cur_color[2] = b / 255.0f;
         cur_color[3] = a / 255.0f;
     }
-    if (real_gl_color4ub && !im_skip_gl)
+    if (real_gl_color4ub && !im_skip_gl && !gl_skip_state())
         real_gl_color4ub(r, g, b, a);
 }
 
@@ -3469,7 +3602,7 @@ void glColor4ubv(const GLubyte *v)
         cur_color[2] = v[2] / 255.0f;
         cur_color[3] = v[3] / 255.0f;
     }
-    if (real_gl_color4ubv && !im_skip_gl)
+    if (real_gl_color4ubv && !im_skip_gl && !gl_skip_state())
         real_gl_color4ubv(v);
 }
 
@@ -3479,17 +3612,18 @@ void glMatrixMode(GLenum mode)
         real_gl_matrix_mode = (fn_gl_matrix_mode)next_symbol("glMatrixMode");
     if (geometry_enabled)
         matrix_mode = mode;
-    if (real_gl_matrix_mode)
+    if (real_gl_matrix_mode && !gl_skip_state())
         real_gl_matrix_mode(mode);
 }
 
 void glLoadIdentity(void)
 {
+    xform_serial++;
     if (!real_gl_load_identity)
         real_gl_load_identity = (fn_gl_void)next_symbol("glLoadIdentity");
     if (geometry_enabled)
         mat_identity(current_matrix());
-    if (real_gl_load_identity)
+    if (real_gl_load_identity && !gl_skip_state())
         real_gl_load_identity();
 }
 
@@ -3503,12 +3637,13 @@ void glPushMatrix(void)
         if (*sp < 32)
             stack[(*sp)++] = *current_matrix();
     }
-    if (real_gl_push_matrix)
+    if (real_gl_push_matrix && !gl_skip_state())
         real_gl_push_matrix();
 }
 
 void glPopMatrix(void)
 {
+    xform_serial++;
     if (!real_gl_pop_matrix)
         real_gl_pop_matrix = (fn_gl_void)next_symbol("glPopMatrix");
     if (geometry_enabled) {
@@ -3517,76 +3652,84 @@ void glPopMatrix(void)
         if (*sp > 0)
             *current_matrix() = stack[--(*sp)];
     }
-    if (real_gl_pop_matrix)
+    if (real_gl_pop_matrix && !gl_skip_state())
         real_gl_pop_matrix();
 }
 
 void glTranslatef(GLfloat x, GLfloat y, GLfloat z)
 {
+    xform_serial++;
     if (!real_gl_translatef)
         real_gl_translatef =
             (fn_gl_translate)next_symbol("glTranslatef");
     if (geometry_enabled)
         mat_translate(current_matrix(), x, y, z);
-    if (real_gl_translatef)
+    if (real_gl_translatef && !gl_skip_state())
         real_gl_translatef(x, y, z);
 }
 
 void glRotatef(GLfloat angle, GLfloat x, GLfloat y, GLfloat z)
 {
+    xform_serial++;
     if (!real_gl_rotatef)
         real_gl_rotatef = (fn_gl_rotate)next_symbol("glRotatef");
     if (geometry_enabled)
         mat_rotate(current_matrix(), angle, x, y, z);
-    if (real_gl_rotatef)
+    if (real_gl_rotatef && !gl_skip_state())
         real_gl_rotatef(angle, x, y, z);
 }
 
 void glScalef(GLfloat x, GLfloat y, GLfloat z)
 {
+    xform_serial++;
     if (!real_gl_scalef)
         real_gl_scalef = (fn_gl_translate)next_symbol("glScalef");
     if (geometry_enabled)
         mat_scale(current_matrix(), x, y, z);
-    if (real_gl_scalef)
+    if (real_gl_scalef && !gl_skip_state())
         real_gl_scalef(x, y, z);
 }
 
 void glOrtho(GLdouble left, GLdouble right, GLdouble bottom, GLdouble top,
              GLdouble zNear, GLdouble zFar)
 {
+    xform_serial++;
     if (!real_gl_ortho)
         real_gl_ortho = (fn_gl_ortho)next_symbol("glOrtho");
     if (geometry_enabled)
         mat_ortho(current_matrix(), left, right, bottom, top, zNear, zFar);
-    if (real_gl_ortho)
+    if (real_gl_ortho && !gl_skip_state())
         real_gl_ortho(left, right, bottom, top, zNear, zFar);
 }
 
 void glFrustum(GLdouble left, GLdouble right, GLdouble bottom, GLdouble top,
                GLdouble zNear, GLdouble zFar)
 {
+    xform_serial++;
     if (!real_gl_frustum)
         real_gl_frustum = (fn_gl_frustum)next_symbol("glFrustum");
     if (geometry_enabled)
         mat_frustum(current_matrix(), left, right, bottom, top, zNear, zFar);
-    if (real_gl_frustum)
+    if (real_gl_frustum && !gl_skip_state())
         real_gl_frustum(left, right, bottom, top, zNear, zFar);
 }
 
 void glLoadMatrixf(const GLfloat *m)
 {
+    xform_serial++;
     if (!real_gl_load_matrixf)
         real_gl_load_matrixf =
             (fn_gl_load_matrix)next_symbol("glLoadMatrixf");
     if (geometry_enabled && m)
         memcpy(current_matrix()->m, m, 16 * sizeof(float));
-    if (real_gl_load_matrixf)
+    if (real_gl_load_matrixf && !gl_skip_state())
         real_gl_load_matrixf(m);
 }
 
 void glEnable(GLenum cap)
 {
+    state_serial++;
+    xform_serial++; /* GL_CLIP_PLANE0 */
     if (!real_gl_enable)
         real_gl_enable = (fn_gl_enable)next_symbol("glEnable");
     if (geometry_enabled) {
@@ -3606,12 +3749,14 @@ void glEnable(GLenum cap)
         if (cap == 0x3000) /* GL_CLIP_PLANE0 */
             clip0_enabled = 1;
     }
-    if (real_gl_enable)
+    if (real_gl_enable && !(tracked_cap(cap) && gl_skip_state()))
         real_gl_enable(cap);
 }
 
 void glDisable(GLenum cap)
 {
+    state_serial++;
+    xform_serial++; /* GL_CLIP_PLANE0 */
     if (!real_gl_disable)
         real_gl_disable = (fn_gl_disable)next_symbol("glDisable");
     if (geometry_enabled) {
@@ -3631,12 +3776,13 @@ void glDisable(GLenum cap)
         if (cap == 0x3000) /* GL_CLIP_PLANE0 */
             clip0_enabled = 0;
     }
-    if (real_gl_disable)
+    if (real_gl_disable && !(tracked_cap(cap) && gl_skip_state()))
         real_gl_disable(cap);
 }
 
 void glBindTexture(GLenum target, GLuint texture)
 {
+    state_serial++;
     if (!real_gl_bind_texture)
         real_gl_bind_texture = (fn_gl_bind_texture)next_symbol("glBindTexture");
     if (geometry_enabled && target == GL_TEXTURE_2D) {
@@ -3712,6 +3858,7 @@ static fn_gl_delete_textures real_gl_delete_textures;
  * (map changes delete thousands of textures). */
 void glDeleteTextures(GLsizei n, const GLuint *textures)
 {
+    state_serial++;
     GLsizei k;
 
     if (!real_gl_delete_textures)
@@ -3858,18 +4005,20 @@ void glTexParameterf(GLenum target, GLenum pname, GLfloat param)
 
 void glAlphaFunc(GLenum func, GLfloat ref)
 {
+    state_serial++;
     if (!real_gl_alpha_func)
         real_gl_alpha_func = (fn_gl_alpha_func)next_symbol("glAlphaFunc");
     if (geometry_enabled) {
         cur_alpha_func = func;
         cur_alpha_ref = ref;
     }
-    if (real_gl_alpha_func)
+    if (real_gl_alpha_func && !gl_skip_state())
         real_gl_alpha_func(func, ref);
 }
 
 static void track_tex_env(GLenum target, GLenum pname, float param)
 {
+    state_serial++;
     if (!geometry_enabled || target != GL_TEXTURE_ENV)
         return;
     if (pname == GL_TEXTURE_ENV_MODE) {
@@ -3884,7 +4033,10 @@ void glTexEnvf(GLenum target, GLenum pname, GLfloat param)
     if (!real_gl_tex_envf)
         real_gl_tex_envf = (fn_gl_tex_envf)next_symbol("glTexEnvf");
     track_tex_env(target, pname, param);
-    if (real_gl_tex_envf)
+    if (real_gl_tex_envf &&
+        !(target == GL_TEXTURE_ENV &&
+          (pname == GL_TEXTURE_ENV_MODE || pname == GL_RGB_SCALE_ENUM) &&
+          gl_skip_state()))
         real_gl_tex_envf(target, pname, param);
 }
 
@@ -3893,7 +4045,10 @@ void glTexEnvi(GLenum target, GLenum pname, GLint param)
     if (!real_gl_tex_envi)
         real_gl_tex_envi = (fn_gl_tex_envi)next_symbol("glTexEnvi");
     track_tex_env(target, pname, (float)param);
-    if (real_gl_tex_envi)
+    if (real_gl_tex_envi &&
+        !(target == GL_TEXTURE_ENV &&
+          (pname == GL_TEXTURE_ENV_MODE || pname == GL_RGB_SCALE_ENUM) &&
+          gl_skip_state()))
         real_gl_tex_envi(target, pname, param);
 }
 
@@ -3952,7 +4107,7 @@ void glMultiTexCoord2f(GLenum target, GLfloat s, GLfloat t)
         real_gl_multi_texcoord2f =
             (fn_gl_multi_texcoord2f)next_symbol("glMultiTexCoord2f");
     set_multi_texcoord(target, s, t);
-    if (real_gl_multi_texcoord2f && !im_skip_gl)
+    if (real_gl_multi_texcoord2f && !im_skip_gl && !gl_skip_state())
         real_gl_multi_texcoord2f(target, s, t);
 }
 
@@ -3962,7 +4117,7 @@ void glMultiTexCoord2fARB(GLenum target, GLfloat s, GLfloat t)
         real_gl_multi_texcoord2f_arb =
             (fn_gl_multi_texcoord2f)next_symbol("glMultiTexCoord2fARB");
     set_multi_texcoord(target, s, t);
-    if (real_gl_multi_texcoord2f_arb && !im_skip_gl)
+    if (real_gl_multi_texcoord2f_arb && !im_skip_gl && !gl_skip_state())
         real_gl_multi_texcoord2f_arb(target, s, t);
 }
 
@@ -3973,7 +4128,7 @@ void glMultiTexCoord2fv(GLenum target, const GLfloat *v)
             (fn_gl_multi_texcoord2fv)next_symbol("glMultiTexCoord2fv");
     if (v)
         set_multi_texcoord(target, v[0], v[1]);
-    if (real_gl_multi_texcoord2fv && !im_skip_gl)
+    if (real_gl_multi_texcoord2fv && !im_skip_gl && !gl_skip_state())
         real_gl_multi_texcoord2fv(target, v);
 }
 
@@ -3984,19 +4139,20 @@ void glMultiTexCoord2fvARB(GLenum target, const GLfloat *v)
             (fn_gl_multi_texcoord2fv)next_symbol("glMultiTexCoord2fvARB");
     if (v)
         set_multi_texcoord(target, v[0], v[1]);
-    if (real_gl_multi_texcoord2fv_arb && !im_skip_gl)
+    if (real_gl_multi_texcoord2fv_arb && !im_skip_gl && !gl_skip_state())
         real_gl_multi_texcoord2fv_arb(target, v);
 }
 
 void glBlendFunc(GLenum sfactor, GLenum dfactor)
 {
+    state_serial++;
     if (!real_gl_blend_func)
         real_gl_blend_func = (fn_gl_blend_func)next_symbol("glBlendFunc");
     if (geometry_enabled) {
         cur_blend_src = sfactor;
         cur_blend_dst = dfactor;
     }
-    if (real_gl_blend_func)
+    if (real_gl_blend_func && !gl_skip_state())
         real_gl_blend_func(sfactor, dfactor);
 }
 
@@ -4088,6 +4244,7 @@ void glColorPointer(GLint size, GLenum type, GLsizei stride,
 
 void glDepthRange(GLclampd near_val, GLclampd far_val)
 {
+    xform_serial++;
     if (!real_gl_depth_range)
         real_gl_depth_range = (fn_gl_depth_range)next_symbol("glDepthRange");
     if (geometry_enabled) {
@@ -4106,8 +4263,10 @@ void glDrawArrays(GLenum mode, GLint first, GLsizei count)
         real_gl_draw_arrays = (fn_gl_draw_arrays)next_symbol("glDrawArrays");
     if (geometry_enabled)
         emit_array_geometry(mode, first, count);
-    if (real_gl_draw_arrays && !(geometry_enabled && should_skip_gl_draw()))
+    if (real_gl_draw_arrays && !(geometry_enabled && should_skip_gl_draw())) {
+        gl_sync();
         real_gl_draw_arrays(mode, first, count);
+    }
 }
 
 void glBindFramebufferEXT(GLenum target, GLuint framebuffer)
@@ -4247,8 +4406,10 @@ void glCopyTexSubImage2D(GLenum target, GLint level, GLint xoff, GLint yoff,
     dbg_event("CopyTexSubImage2D tex=%u dst=%d,%d src=%d,%d %dx%d",
               cur_texture, xoff, yoff, x, y, w, h);
     handled = queue_framebuffer_copy(target, level, xoff, yoff, x, y, w, h);
-    if (real_gl_copy_tex_sub2d && !(handled && should_skip_gl_draw()))
+    if (real_gl_copy_tex_sub2d && !(handled && should_skip_gl_draw())) {
+        gl_sync();
         real_gl_copy_tex_sub2d(target, level, xoff, yoff, x, y, w, h);
+    }
 }
 void glCopyTexImage2D(GLenum target, GLint level, GLenum ifmt, GLint x, GLint y,
                       GLsizei w, GLsizei h, GLint border)
@@ -4267,11 +4428,14 @@ void glCopyTexImage2D(GLenum target, GLint level, GLenum ifmt, GLint x, GLint y,
         handled = queue_framebuffer_copy(target, level, 0, 0, x, y, w, h);
     }
     (void)ifmt;
-    if (real_gl_copy_tex2d && !(handled && should_skip_gl_draw()))
+    if (real_gl_copy_tex2d && !(handled && should_skip_gl_draw())) {
+        gl_sync();
         real_gl_copy_tex2d(target, level, ifmt, x, y, w, h, border);
+    }
 }
 void glClipPlane(GLenum plane, const GLdouble *eq)
 {
+    xform_serial++;
     LAZY(real_gl_clip_plane, fn_gl_clip_plane, "glClipPlane");
     dbg_event("ClipPlane 0x%x", plane);
     if (geometry_enabled && plane == 0x3000 && eq) {
@@ -4286,34 +4450,42 @@ void glClipPlane(GLenum plane, const GLdouble *eq)
                                        eq[3] * inv[c * 4 + 3]);
         }
     }
-    if (real_gl_clip_plane)
+    if (real_gl_clip_plane && !gl_skip_state())
         real_gl_clip_plane(plane, eq);
 }
 void glStencilFunc(GLenum func, GLint ref, GLuint mask)
 {
+    state_serial++;
     LAZY(real_gl_stencil_func, fn_gl_stencil_func, "glStencilFunc");
     dbg_event("StencilFunc 0x%x ref=%d mask=0x%x", func, ref, mask);
     st_func = func;
     st_ref = ref;
-    if (real_gl_stencil_func)
+    st_mask = mask;
+    if (real_gl_stencil_func && !gl_skip_state())
         real_gl_stencil_func(func, ref, mask);
 }
 void glStencilOp(GLenum sf, GLenum zf, GLenum zp)
 {
+    state_serial++;
     LAZY(real_gl_stencil_op, fn_gl_stencil_op, "glStencilOp");
     dbg_event("StencilOp 0x%x 0x%x 0x%x", sf, zf, zp);
     st_sfail = sf;
     st_zfail = zf;
     st_zpass = zp;
-    if (real_gl_stencil_op)
+    if (real_gl_stencil_op && !gl_skip_state())
         real_gl_stencil_op(sf, zf, zp);
 }
 void glColorMask(GLboolean r, GLboolean g, GLboolean b, GLboolean a)
 {
+    state_serial++;
     LAZY(real_gl_color_mask, fn_gl_color_mask, "glColorMask");
     dbg_event("ColorMask %d%d%d%d", r, g, b, a);
     color_mask_off = !(r || g || b || a);
-    if (real_gl_color_mask)
+    color_mask_rgba[0] = r;
+    color_mask_rgba[1] = g;
+    color_mask_rgba[2] = b;
+    color_mask_rgba[3] = a;
+    if (real_gl_color_mask && !gl_skip_state())
         real_gl_color_mask(r, g, b, a);
 }
 void glViewport(GLint x, GLint y, GLsizei w, GLsizei h)
@@ -4325,31 +4497,148 @@ void glViewport(GLint x, GLint y, GLsizei w, GLsizei h)
 }
 void glDepthFunc(GLenum func)
 {
+    state_serial++;
     LAZY(real_gl_depth_func, fn_gl_enum1, "glDepthFunc");
     dbg_event("DepthFunc 0x%x", func);
     if (func >= 0x200 && func <= 0x207)
         gl_depth_func = func;
-    if (real_gl_depth_func)
+    if (real_gl_depth_func && !gl_skip_state())
         real_gl_depth_func(func);
 }
 void glDepthMask(GLboolean flag)
 {
+    state_serial++;
     LAZY(real_gl_depth_mask, fn_gl_bool1, "glDepthMask");
     dbg_event("DepthMask %d", flag);
     depth_write_enabled = flag ? 1 : 0;
-    if (real_gl_depth_mask)
+    if (real_gl_depth_mask && !gl_skip_state())
         real_gl_depth_mask(flag);
 }
 typedef void (*fn_gl_poly_offset)(GLfloat, GLfloat);
 static fn_gl_poly_offset real_gl_polygon_offset;
 void glPolygonOffset(GLfloat factor, GLfloat units)
 {
+    state_serial++;
     LAZY(real_gl_polygon_offset, fn_gl_poly_offset, "glPolygonOffset");
     dbg_event("PolygonOffset factor=%.2f units=%.2f", factor, units);
     poly_offset_factor = factor;
     poly_offset_units = units;
-    if (real_gl_polygon_offset)
+    if (real_gl_polygon_offset && !gl_skip_state())
         real_gl_polygon_offset(factor, units);
+}
+
+
+/* Push every tracked piece of state into OpenGL (see gl_skip_state). */
+static void gl_resync_state(void)
+{
+    static const GLenum caps[6] = {GL_BLEND, GL_DEPTH_TEST, 0xbc0, 0xb90,
+                                   0x8037, 0x3000};
+    int on[6];
+    int u, i;
+
+    LAZY(real_gl_enable, fn_gl_enable, "glEnable");
+    LAZY(real_gl_disable, fn_gl_disable, "glDisable");
+    LAZY(real_gl_tex_envf, fn_gl_tex_envf, "glTexEnvf");
+    LAZY(real_gl_blend_func, fn_gl_blend_func, "glBlendFunc");
+    LAZY(real_gl_alpha_func, fn_gl_alpha_func, "glAlphaFunc");
+    LAZY(real_gl_depth_func, fn_gl_enum1, "glDepthFunc");
+    LAZY(real_gl_depth_mask, fn_gl_bool1, "glDepthMask");
+    LAZY(real_gl_color_mask, fn_gl_color_mask, "glColorMask");
+    LAZY(real_gl_stencil_func, fn_gl_stencil_func, "glStencilFunc");
+    LAZY(real_gl_stencil_op, fn_gl_stencil_op, "glStencilOp");
+    LAZY(real_gl_polygon_offset, fn_gl_poly_offset, "glPolygonOffset");
+    LAZY(real_gl_matrix_mode, fn_gl_matrix_mode, "glMatrixMode");
+    LAZY(real_gl_load_matrixf, fn_gl_load_matrix, "glLoadMatrixf");
+    LAZY(real_gl_load_identity, fn_gl_void, "glLoadIdentity");
+    LAZY(real_gl_clip_plane, fn_gl_clip_plane, "glClipPlane");
+    LAZY(real_gl_color4f, fn_gl_color4f, "glColor4f");
+    LAZY(real_gl_texcoord2f, fn_gl_texcoord2f, "glTexCoord2f");
+    if (!real_gl_active_texture_arb && !real_gl_active_texture)
+        real_gl_active_texture_arb =
+            (fn_gl_active_texture)next_symbol("glActiveTextureARB");
+    if (!real_gl_enable || !real_gl_disable)
+        return;
+
+    /* per texture unit: enable + env mode / RGB scale */
+    for (u = 1; u >= 0; u--) {
+        fn_gl_active_texture at = real_gl_active_texture_arb
+                                      ? real_gl_active_texture_arb
+                                      : real_gl_active_texture;
+        if (at)
+            at(GL_TEXTURE0_ENUM + u);
+        else if (u)
+            continue;
+        (unit_tex_enabled[u] ? real_gl_enable : real_gl_disable)(GL_TEXTURE_2D);
+        if (real_gl_tex_envf) {
+            real_gl_tex_envf(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE,
+                             (float)unit_env_mode[u]);
+            if (unit_env_mode[u] == GL_COMBINE_ENUM)
+                real_gl_tex_envf(GL_TEXTURE_ENV, GL_RGB_SCALE_ENUM,
+                                 unit_rgb_scale[u]);
+        }
+    }
+    {
+        fn_gl_active_texture at = real_gl_active_texture_arb
+                                      ? real_gl_active_texture_arb
+                                      : real_gl_active_texture;
+        if (at)
+            at(GL_TEXTURE0_ENUM + active_unit);
+    }
+
+    on[0] = blend_enabled;
+    on[1] = depth_test_enabled;
+    on[2] = alpha_test_enabled;
+    on[3] = stencil_test_enabled;
+    on[4] = polygon_offset_enabled;
+    on[5] = clip0_enabled;
+    for (i = 0; i < 6; i++)
+        (on[i] ? real_gl_enable : real_gl_disable)(caps[i]);
+
+    if (real_gl_blend_func)
+        real_gl_blend_func(cur_blend_src, cur_blend_dst);
+    if (real_gl_alpha_func)
+        real_gl_alpha_func(cur_alpha_func, cur_alpha_ref);
+    if (real_gl_depth_func)
+        real_gl_depth_func(gl_depth_func);
+    if (real_gl_depth_mask)
+        real_gl_depth_mask((GLboolean)depth_write_enabled);
+    if (real_gl_color_mask)
+        real_gl_color_mask(color_mask_rgba[0], color_mask_rgba[1],
+                           color_mask_rgba[2], color_mask_rgba[3]);
+    if (real_gl_stencil_func)
+        real_gl_stencil_func(st_func, st_ref, st_mask);
+    if (real_gl_stencil_op)
+        real_gl_stencil_op(st_sfail, st_zfail, st_zpass);
+    if (real_gl_polygon_offset)
+        real_gl_polygon_offset(poly_offset_factor, poly_offset_units);
+
+    if (real_gl_matrix_mode && real_gl_load_matrixf) {
+        real_gl_matrix_mode(GL_PROJECTION);
+        real_gl_load_matrixf(mat_proj.m);
+        real_gl_matrix_mode(GL_MODELVIEW);
+        /* clip plane is given in eye space: load it under identity */
+        if (real_gl_load_identity && real_gl_clip_plane) {
+            GLdouble eq[4];
+            real_gl_load_identity();
+            for (i = 0; i < 4; i++)
+                eq[i] = clip0_eye[i];
+            real_gl_clip_plane(0x3000, eq);
+        }
+        real_gl_load_matrixf(mat_model.m);
+        real_gl_matrix_mode(matrix_mode);
+    }
+    if (real_gl_color4f)
+        real_gl_color4f(cur_color[0], cur_color[1], cur_color[2], cur_color[3]);
+    if (real_gl_texcoord2f)
+        real_gl_texcoord2f(cur_u, cur_v);
+}
+
+static void gl_sync(void)
+{
+    if (!gl_out_of_sync)
+        return;
+    gl_out_of_sync = 0;
+    gl_resync_state();
 }
 
 void glCullFace(GLenum mode)
@@ -4361,6 +4650,113 @@ void glCullFace(GLenum mode)
 }
 
 #endif /* VKSKELETON_NO_GEOMETRY_WRAPPERS */
+
+
+/* Render side of one frame: everything comes from the rec_* snapshot. */
+static int run_render_job(void)
+{
+    if (begin_frame()) {
+        record_frame_vertices();
+        if (end_frame_present())
+            return 1;
+    }
+    /* not presented: still execute the slot's texture uploads */
+    if (rec_has_upload) {
+        VkSubmitInfo si = {0};
+        si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+        si.commandBufferCount = 1;
+        si.pCommandBuffers = &upload_cmds[rec_slot];
+        pthread_mutex_lock(&queue_mtx);
+        p_vkResetFences(device, 1, &upload_fence);
+        if (p_vkQueueSubmit(queue, 1, &si, upload_fence) == VK_SUCCESS)
+            p_vkWaitForFences(device, 1, &upload_fence, VK_TRUE, UINT64_MAX);
+        pthread_mutex_unlock(&queue_mtx);
+    }
+    return 0;
+}
+
+static void *render_thread_main(void *arg)
+{
+    (void)arg;
+    pthread_mutex_lock(&rt_mtx);
+    for (;;) {
+        while (!rt_job_pending)
+            pthread_cond_wait(&rt_job_cv, &rt_mtx);
+        rt_job_pending = 0;
+        rt_busy = 1;
+        pthread_mutex_unlock(&rt_mtx);
+        run_render_job();
+        pthread_mutex_lock(&rt_mtx);
+        rt_busy = 0;
+        pthread_cond_broadcast(&rt_done_cv);
+    }
+    return NULL;
+}
+
+static void render_thread_wait_idle(void)
+{
+    if (!render_thread_started)
+        return;
+    pthread_mutex_lock(&rt_mtx);
+    while (rt_job_pending || rt_busy)
+        pthread_cond_wait(&rt_done_cv, &rt_mtx);
+    pthread_mutex_unlock(&rt_mtx);
+}
+
+/* Game side: snapshot the finished frame, hand it to the render side (in
+ * place, or to the render thread) and move on to the next slot.  Returns 1
+ * if the frame was taken over by Vulkan. */
+static int submit_frame(void)
+{
+    int presented = 1;
+
+    if (render_thread_enabled && !render_thread_started) {
+        if (pthread_create(&render_thread, NULL, render_thread_main, NULL) == 0) {
+            render_thread_started = 1;
+            logmsg("vkskeleton: render thread started\n");
+        } else {
+            render_thread_enabled = 0;
+            logmsg("vkskeleton: render thread failed to start; synchronous\n");
+        }
+    }
+    if (render_thread_started)
+        render_thread_wait_idle(); /* one job in flight at a time */
+
+    if (upload_recording) {
+        p_vkEndCommandBuffer(upload_cmds[cur_frame]);
+        upload_recording = 0;
+        rec_has_upload = 1;
+    } else {
+        rec_has_upload = 0;
+    }
+    rec_slot = cur_frame;
+    rec_cmds = frame_cmds;
+    rec_cmd_count = frame_slot_ready ? frame_cmd_count : 0;
+    rec_batches = frame_batches;
+    rec_mats = frame_mats;
+    rec_vertex_count = frame_vertex_count;
+    memcpy(rec_clear_color, clear_color, sizeof(rec_clear_color));
+
+    if (render_thread_started) {
+        pthread_mutex_lock(&rt_mtx);
+        rt_job_pending = 1;
+        pthread_cond_signal(&rt_job_cv);
+        pthread_mutex_unlock(&rt_mtx);
+    } else {
+        presented = run_render_job();
+    }
+
+    cur_frame = (cur_frame + 1) % FRAMES_IN_FLIGHT;
+    frame_slot_ready = 0;
+    frame_batch_count = 0;
+    frame_cmd_count = 0;
+    frame_mat_count = 0;
+    frame_epoch++;
+    frame_vertex_count = 0;
+    frame_index_count = 0;
+    frame_has_clear = 0;
+    return presented;
+}
 
 void SDL_GL_SwapWindow(void *window)
 {
@@ -4375,19 +4771,18 @@ void SDL_GL_SwapWindow(void *window)
         return;
     }
 
-    if ((frame_has_clear || frame_vertex_count) && begin_frame()) {
-        record_frame_vertices();
-        if (end_frame_present())
-            return;
-    }
+    if ((frame_has_clear || frame_vertex_count) && submit_frame())
+        return;
     /* Frame not presented by Vulkan (e.g. minimized/resizing): drop it, but
      * still execute its texture uploads. */
     if (upload_recording)
         flush_uploads_sync();
     frame_vertex_count = 0;
+    frame_index_count = 0;
     frame_batch_count = 0;
     frame_cmd_count = 0;
     frame_mat_count = 0;
+    frame_epoch++;
     frame_has_clear = 0;
 
     if (!real_sdl_swap_window)
@@ -4753,6 +5148,8 @@ __attribute__((constructor)) static void vkskeleton_init(void)
 
     e = getenv("VKSKELETON_ENABLE");
     enabled = e && *e && strcmp(e, "0");
+    e = getenv("VKSKELETON_RENDER_THREAD");
+    render_thread_enabled = e && *e && strcmp(e, "0");
     e = getenv("VKSKELETON_GL_PASSTHROUGH");
     skip_gl_draws = !(e && *e && strcmp(e, "0"));
     e = getenv("VKSKELETON_DEBUG");
