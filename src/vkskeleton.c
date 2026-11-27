@@ -438,6 +438,8 @@ static int rec_eye_count;
 static VkExtent2D rec_eye_extent;
 static vkx_eye_t rec_eyes[2];
 static int rec_hud;               /* module wants the HUD separate */
+static int rec_vm_valid;          /* vkx_viewmodel: move the viewmodel */
+static float rec_vm[16];
 static int cur_eye = -1;          /* replay target: -1 swapchain, else eye */
 static VkRect2D cur_rect;         /* replay target area */
 static size_t rec_vertex_count;
@@ -2969,6 +2971,17 @@ static const float *replay_mat(uint32_t mi, float *out)
     p.m[14] = s[20 + 14];
     memcpy(mv.m, s + 36, sizeof(mv.m));
     memcpy(ev.m, e->eye, sizeof(ev.m));
+    /* viewmodel: drawn with a compressed glDepthRange (GoldSrc: 0..0.3) */
+    if (rec_vm_valid && s[52] < 0.45f) {
+        static int logged;
+        mat4 vm;
+        memcpy(vm.m, rec_vm, sizeof(vm.m));
+        mat_mul(&mv, &vm, &mv);
+        if (!logged) {
+            logged = 1;
+            logmsg("vkskeleton: vkx viewmodel draws found\n");
+        }
+    }
     mat_mul(&t, &ev, &mv);
     mat_mul(&t, &p, &t);
     fix_clip(t.m, s[52], s[53], out);
@@ -4650,6 +4663,20 @@ void glDepthRange(GLclampd near_val, GLclampd far_val)
                                                                   : (float)near_val;
         depth_range_far = far_val < 0.0 ? 0.0f : far_val > 1.0 ? 1.0f
                                                                : (float)far_val;
+        { /* distinct ranges, once: the viewmodel uses a compressed one */
+            static float seen[8][2];
+            static int nseen;
+            int i;
+            for (i = 0; i < nseen; i++)
+                if (seen[i][0] == depth_range_near && seen[i][1] == depth_range_far)
+                    break;
+            if (i == nseen && nseen < 8) {
+                seen[nseen][0] = depth_range_near;
+                seen[nseen++][1] = depth_range_far;
+                logf_msg("vkskeleton: glDepthRange %.3f..%.3f\n",
+                         (double)depth_range_near, (double)depth_range_far);
+            }
+        }
     }
     if (real_gl_depth_range)
         real_gl_depth_range(near_val, far_val);
@@ -5137,6 +5164,7 @@ static int submit_frame(void)
     memcpy(rec_proj_tan, last_proj_tan, sizeof(rec_proj_tan));
     rec_eye_count = vkx_eyes ? vkx_eyes(&rec_eye_extent, rec_eyes) : 0;
     rec_hud = rec_eye_count && vkx_hud && vkx_hud();
+    rec_vm_valid = rec_eye_count && vkx_viewmodel && vkx_viewmodel(rec_vm);
     if (rec_eye_count < 0 || rec_eye_count > 2 || !rec_eye_extent.width ||
         !rec_eye_extent.height || rec_eye_extent.width > 8192 ||
         rec_eye_extent.height > 8192)
@@ -5394,6 +5422,17 @@ static void vk_V_CalcRefdef(void *pparams)
     memcpy(p + 12, u, sizeof(u));            /* up */
 }
 
+/* client.so Initialize(cl_enginefunc_t *, int): hands modules the engine
+ * function table (HL SDK cdll_int.h). */
+typedef int (*fn_cl_initialize)(void *, int);
+static fn_cl_initialize real_cl_initialize;
+static int vk_cl_Initialize(void *funcs, int version)
+{
+    if (vkx_engine_funcs)
+        vkx_engine_funcs(funcs);
+    return real_cl_initialize(funcs, version);
+}
+
 static void *substitute(const char *symbol, void *result)
 {
     if (!enabled || !symbol || !result)
@@ -5406,6 +5445,16 @@ static void *substitute(const char *symbol, void *result)
         if (!real_v_calcrefdef)
             real_v_calcrefdef = (fn_v_calcrefdef)result;
         return (void *)vk_V_CalcRefdef;
+    }
+    if (!strcmp(symbol, "Initialize") && vkx_engine_funcs && !real_cl_initialize) {
+        Dl_info di; /* many libraries export an "Initialize": client.so only */
+        size_t n;
+        if (dladdr(result, &di) && di.dli_fname &&
+            (n = strlen(di.dli_fname)) >= 9 &&
+            !strcmp(di.dli_fname + n - 9, "client.so")) {
+            real_cl_initialize = (fn_cl_initialize)result;
+            return (void *)vk_cl_Initialize;
+        }
     }
     if (!strcmp(symbol, "CL_CreateMove")) { /* freeze player in freecam */
         if (!real_cl_createmove)

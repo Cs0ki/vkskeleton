@@ -53,6 +53,15 @@ __attribute__((weak)) int vkx_eyes(VkExtent2D *eye_extent, vkx_eye_t eyes[2]);
  * add light (alpha unchanged). */
 __attribute__((weak)) int vkx_hud(void);
 
+/* Viewmodel (first-person weapon): return nonzero and fill `m`
+ * (column-major) to have the eye views draw it at m * its modelview, i.e.
+ * moved within the game's eye space (e.g. to a tracked hand).  Called with
+ * vkx_eyes. */
+__attribute__((weak)) int vkx_viewmodel(float m[16]);
+
+/* client.so Initialize: `funcs` is the engine's cl_enginefunc_t table. */
+__attribute__((weak)) void vkx_engine_funcs(void *funcs);
+
 /* After the game's CL_CreateMove filled `cmd` (HL SDK usercmd_t). */
 __attribute__((weak)) void vkx_create_move(float frametime, void *cmd,
                                            int active);
