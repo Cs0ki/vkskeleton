@@ -446,6 +446,7 @@ static size_t rec_vertex_count;
 static int rec_has_upload;
 static float rec_clear_color[4];
 static float last_proj_tan[4];   /* game side: last perspective projection */
+static float last_persp_proj[16]; /* ... and the matrix (0 until seen) */
 static float rec_proj_tan[4];    /* snapshot for vkx_frame_end */
 /* Opt-in render thread (VKSKELETON_RENDER_THREAD=1). */
 static int render_thread_enabled;
@@ -3558,6 +3559,7 @@ static void append_geometry(void)
                 last_proj_tan[1] = (m[8] + 1.0f) / m[0];
                 last_proj_tan[2] = (m[9] - 1.0f) / m[5];
                 last_proj_tan[3] = (m[9] + 1.0f) / m[5];
+                memcpy(last_persp_proj, m, sizeof(last_persp_proj));
             }
             done_xform = xform_serial;
             done_epoch = frame_epoch;
@@ -5131,6 +5133,87 @@ static void render_thread_wait_idle(void)
 /* Game side: snapshot the finished frame, hand it to the render side (in
  * place, or to the render thread) and move on to the next slot.  Returns 1
  * if the frame was taken over by Vulkan. */
+/* vkx_laser: a thin additive beam (two crossed quads, fading out) from the
+ * module's ray in the game's eye space, depth-tested so walls hide it. */
+static void append_laser(void)
+{
+    const float len = 800.0f, w = 0.35f; /* game units */
+    float from[3], dir[3], n1[3], n2[3], o[MAT_FLOATS], l;
+    frame_batch_t *b;
+    vk_vertex_t *v;
+    uint32_t *ix, base, i;
+    int q, k;
+
+    if (!vkx_laser || !frame_slot_ready || last_persp_proj[11] > -0.5f ||
+        frame_vertex_count + 8 > FRAME_MAX_VERTICES ||
+        frame_index_count + 12 > FRAME_MAX_INDICES ||
+        frame_batch_count >= MAX_FRAME_BATCHES ||
+        frame_cmd_count >= MAX_FRAME_CMDS || frame_mat_count >= MAX_FRAME_MATS ||
+        !vkx_laser(from, dir))
+        return;
+    l = sqrtf(dir[0] * dir[0] + dir[1] * dir[1] + dir[2] * dir[2]);
+    if (l < 1e-6f)
+        return;
+    for (k = 0; k < 3; k++)
+        dir[k] /= l;
+    /* two axes perpendicular to the beam */
+    if (fabsf(dir[1]) < 0.9f) { /* n1 = dir x up */
+        n1[0] = -dir[2]; n1[1] = 0; n1[2] = dir[0];
+    } else {                    /* n1 = dir x right */
+        n1[0] = 0; n1[1] = dir[2]; n1[2] = -dir[1];
+    }
+    l = sqrtf(n1[0] * n1[0] + n1[1] * n1[1] + n1[2] * n1[2]);
+    for (k = 0; k < 3; k++)
+        n1[k] /= l;
+    n2[0] = dir[1] * n1[2] - dir[2] * n1[1];
+    n2[1] = dir[2] * n1[0] - dir[0] * n1[2];
+    n2[2] = dir[0] * n1[1] - dir[1] * n1[0];
+
+    /* matrix: the game's projection, identity modelview (eye space) */
+    memset(o, 0, sizeof(o));
+    fix_clip(last_persp_proj, 0.5f, 0.5f, o);
+    o[19] = 1.0f; /* no clip plane */
+    memcpy(o + 20, last_persp_proj, sizeof(last_persp_proj));
+    o[36] = o[41] = o[46] = o[51] = 1.0f;
+    o[52] = o[53] = 0.5f;
+    memcpy(frame_mats[frame_mat_count], o, sizeof(o));
+
+    base = (uint32_t)frame_vertex_count;
+    v = &frame_vertices[frame_vertex_count];
+    for (q = 0; q < 2; q++) {
+        const float *n = q ? n2 : n1;
+        for (i = 0; i < 4; i++) {
+            float side = (i & 1) ? w : -w, t = (i & 2) ? len : 0.0f;
+            vk_vertex_t *p = &v[q * 4 + i];
+            memset(p, 0, sizeof(*p));
+            p->x = from[0] + dir[0] * t + n[0] * side;
+            p->y = from[1] + dir[1] * t + n[1] * side;
+            p->z = from[2] + dir[2] * t + n[2] * side;
+            p->r = 1.0f; p->g = 0.12f; p->b = 0.08f;
+            p->a = (i & 2) ? 0.0f : 0.9f; /* fades along the beam */
+            p->alpha_ref = -1.0f;
+        }
+    }
+    ix = &frame_indices[frame_index_count];
+    for (q = 0; q < 2; q++) {
+        uint32_t s0 = base + (uint32_t)q * 4;
+        ix[q * 6 + 0] = s0; ix[q * 6 + 1] = s0 + 1; ix[q * 6 + 2] = s0 + 3;
+        ix[q * 6 + 3] = s0; ix[q * 6 + 4] = s0 + 3; ix[q * 6 + 5] = s0 + 2;
+    }
+    frame_cmds[frame_cmd_count].type = FCMD_DRAW;
+    frame_cmds[frame_cmd_count].a = frame_batch_count;
+    frame_cmd_count++;
+    b = &frame_batches[frame_batch_count++];
+    memset(b, 0, sizeof(*b));
+    b->first = (uint32_t)frame_index_count;
+    b->count = 12;
+    b->mat = frame_mat_count++;
+    /* additive (src alpha, one), depth test LEQUAL, no depth write */
+    b->pkey = BLEND_ADD_ALPHA | (1u << 2) | ((0x203u - 0x200u) << 18) | (1u << 4);
+    frame_vertex_count += 8;
+    frame_index_count += 12;
+}
+
 static int submit_frame(void)
 {
     int presented = 1;
@@ -5154,6 +5237,7 @@ static int submit_frame(void)
     } else {
         rec_has_upload = 0;
     }
+    append_laser();
     rec_slot = cur_frame;
     rec_cmds = frame_cmds;
     rec_cmd_count = frame_slot_ready ? frame_cmd_count : 0;

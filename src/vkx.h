@@ -64,6 +64,10 @@ __attribute__((weak)) int vkx_viewmodel(float m[16]);
  * CL_CreateMove go through vkx_view / vkx_create_move instead. */
 __attribute__((weak)) void *vkx_client_symbol(const char *name, void *real);
 
+/* Laser pointer: return nonzero with a ray (origin, direction) in the
+ * game's eye space, game units, to draw a beam along it this frame. */
+__attribute__((weak)) int vkx_laser(float from[3], float dir[3]);
+
 /* After the game's CL_CreateMove filled `cmd` (HL SDK usercmd_t). */
 __attribute__((weak)) void vkx_create_move(float frametime, void *cmd,
                                            int active);
