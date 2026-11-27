@@ -59,8 +59,10 @@ __attribute__((weak)) int vkx_hud(void);
  * vkx_eyes. */
 __attribute__((weak)) int vkx_viewmodel(float m[16]);
 
-/* client.so Initialize: `funcs` is the engine's cl_enginefunc_t table. */
-__attribute__((weak)) void vkx_engine_funcs(void *funcs);
+/* An export of client.so is being looked up (by the engine): return a
+ * replacement to wrap it (it must call `real`), or NULL.  V_CalcRefdef and
+ * CL_CreateMove go through vkx_view / vkx_create_move instead. */
+__attribute__((weak)) void *vkx_client_symbol(const char *name, void *real);
 
 /* After the game's CL_CreateMove filled `cmd` (HL SDK usercmd_t). */
 __attribute__((weak)) void vkx_create_move(float frametime, void *cmd,

@@ -5422,17 +5422,6 @@ static void vk_V_CalcRefdef(void *pparams)
     memcpy(p + 12, u, sizeof(u));            /* up */
 }
 
-/* client.so Initialize(cl_enginefunc_t *, int): hands modules the engine
- * function table (HL SDK cdll_int.h). */
-typedef int (*fn_cl_initialize)(void *, int);
-static fn_cl_initialize real_cl_initialize;
-static int vk_cl_Initialize(void *funcs, int version)
-{
-    if (vkx_engine_funcs)
-        vkx_engine_funcs(funcs);
-    return real_cl_initialize(funcs, version);
-}
-
 static void *substitute(const char *symbol, void *result)
 {
     if (!enabled || !symbol || !result)
@@ -5446,20 +5435,21 @@ static void *substitute(const char *symbol, void *result)
             real_v_calcrefdef = (fn_v_calcrefdef)result;
         return (void *)vk_V_CalcRefdef;
     }
-    if (!strcmp(symbol, "Initialize") && vkx_engine_funcs && !real_cl_initialize) {
-        Dl_info di; /* many libraries export an "Initialize": client.so only */
-        size_t n;
-        if (dladdr(result, &di) && di.dli_fname &&
-            (n = strlen(di.dli_fname)) >= 9 &&
-            !strcmp(di.dli_fname + n - 9, "client.so")) {
-            real_cl_initialize = (fn_cl_initialize)result;
-            return (void *)vk_cl_Initialize;
-        }
-    }
     if (!strcmp(symbol, "CL_CreateMove")) { /* freeze player in freecam */
         if (!real_cl_createmove)
             real_cl_createmove = (fn_cl_createmove)result;
         return (void *)vk_CL_CreateMove;
+    }
+    if (vkx_client_symbol) {
+        Dl_info di; /* other client.so exports: offered to the module */
+        size_t n;
+        if (dladdr(result, &di) && di.dli_fname &&
+            (n = strlen(di.dli_fname)) >= 9 &&
+            !strcmp(di.dli_fname + n - 9, "client.so")) {
+            void *w = vkx_client_symbol(symbol, result);
+            if (w)
+                return w;
+        }
     }
     if (!geometry_enabled)
         return result;
