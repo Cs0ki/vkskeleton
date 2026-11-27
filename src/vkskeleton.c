@@ -437,6 +437,7 @@ static float (*rec_mats)[MAT_FLOATS];
 static int rec_eye_count;
 static VkExtent2D rec_eye_extent;
 static vkx_eye_t rec_eyes[2];
+static int rec_hud;               /* module wants the HUD separate */
 static int cur_eye = -1;          /* replay target: -1 swapchain, else eye */
 static VkRect2D cur_rect;         /* replay target area */
 static size_t rec_vertex_count;
@@ -2502,6 +2503,7 @@ static uint32_t gl_stencil_op_to_vk(GLenum op)
     }
 }
 
+#define PKEY_HUD_ALPHA (1u << 22) /* HUD target alpha, see create_pipeline_for_key */
 static uint32_t pipeline_key(int blend)
 {
     uint32_t k = (uint32_t)blend & 3u;
@@ -2616,6 +2618,15 @@ static VkPipeline create_pipeline_for_key(uint32_t k)
         cba.colorBlendOp = VK_BLEND_OP_ADD;
         cba.srcAlphaBlendFactor = bsrc[blend];
         cba.dstAlphaBlendFactor = bdst[blend];
+        if (k & PKEY_HUD_ALPHA) {
+            /* HUD target: alpha = coverage for premultiplied composition;
+             * additive draws add light without covering what is behind */
+            int additive = bdst[blend] == VK_BLEND_FACTOR_ONE;
+            cba.srcAlphaBlendFactor = additive ? VK_BLEND_FACTOR_ZERO
+                                               : VK_BLEND_FACTOR_ONE;
+            cba.dstAlphaBlendFactor = additive ? VK_BLEND_FACTOR_ONE
+                                               : VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+        }
         cba.alphaBlendOp = VK_BLEND_OP_ADD;
     }
     cbs.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
@@ -2718,25 +2729,31 @@ static void image_barrier(VkCommandBuffer cb, VkImage image,
     p_vkCmdPipelineBarrier(cb, src_stage, dst_stage, 0, 0, NULL, 0, NULL, 1, &b);
 }
 
-/* ---------- vkx eye views ----------
+/* ---------- vkx eye views and HUD ----------
  * After the main pass, the frame's command list is replayed once per eye
- * into eye_image (eyes side by side) with an eye depth buffer, through a
- * render pass compatible with render_pass (same formats), so the pipelines
- * are shared.  Colour stays in TRANSFER_SRC_OPTIMAL between passes (blit
- * source for mirror copies and for the module). */
+ * into the eye target (eyes side by side) and, if the module wants the HUD
+ * separate, once more with only the 2D draws into the HUD target
+ * (transparent background, premultiplied alpha).  Targets use a render pass
+ * compatible with render_pass (same formats), so pipelines are shared.
+ * Colour stays in TRANSFER_SRC_OPTIMAL between passes (blit source for
+ * mirror copies and for the module). */
+#define VIEW_HUD 2                /* cur_eye value of the HUD replay */
+typedef struct {
+    VkImage image, depth;
+    VkDeviceMemory mem, depth_mem;
+    VkImageView view, depth_view;
+    VkFramebuffer fb;
+    VkExtent2D extent;
+} view_target_t;
+static view_target_t eye_tg, hud_tg, *cur_tg;
 static VkRenderPass eye_pass;
 static VkFormat eye_pass_format;
-static VkImage eye_image, eye_depth;
-static VkDeviceMemory eye_mem, eye_depth_mem;
-static VkImageView eye_view, eye_depth_view;
-static VkFramebuffer eye_fb;
-static VkExtent2D eye_target;
 static void fix_clip(const float *m, float a, float b, float *o);
 static void replay_cmds(VkCommandBuffer cb);
 
-static int eye_alloc(VkFormat fmt, VkImageUsageFlags usage,
-                     VkImageAspectFlags aspect, VkImage *img,
-                     VkDeviceMemory *mem, VkImageView *view)
+static int target_alloc(view_target_t *t, VkFormat fmt, VkImageUsageFlags usage,
+                        VkImageAspectFlags aspect, VkImage *img,
+                        VkDeviceMemory *mem, VkImageView *view)
 {
     VkImageCreateInfo ci = {0};
     VkImageViewCreateInfo vi = {0};
@@ -2746,8 +2763,8 @@ static int eye_alloc(VkFormat fmt, VkImageUsageFlags usage,
     ci.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
     ci.imageType = VK_IMAGE_TYPE_2D;
     ci.format = fmt;
-    ci.extent.width = eye_target.width;
-    ci.extent.height = eye_target.height;
+    ci.extent.width = t->extent.width;
+    ci.extent.height = t->extent.height;
     ci.extent.depth = 1;
     ci.mipLevels = 1;
     ci.arrayLayers = 1;
@@ -2775,24 +2792,20 @@ static int eye_alloc(VkFormat fmt, VkImageUsageFlags usage,
     return p_vkCreateImageView(device, &vi, NULL, view) == VK_SUCCESS;
 }
 
-static void eye_destroy(void)
+static void target_destroy(view_target_t *t)
 {
-    if (eye_fb) p_vkDestroyFramebuffer(device, eye_fb, NULL);
-    if (eye_view) p_vkDestroyImageView(device, eye_view, NULL);
-    if (eye_depth_view) p_vkDestroyImageView(device, eye_depth_view, NULL);
-    if (eye_image) p_vkDestroyImage(device, eye_image, NULL);
-    if (eye_depth) p_vkDestroyImage(device, eye_depth, NULL);
-    if (eye_mem) p_vkFreeMemory(device, eye_mem, NULL);
-    if (eye_depth_mem) p_vkFreeMemory(device, eye_depth_mem, NULL);
-    eye_fb = VK_NULL_HANDLE;
-    eye_view = eye_depth_view = VK_NULL_HANDLE;
-    eye_image = eye_depth = VK_NULL_HANDLE;
-    eye_mem = eye_depth_mem = VK_NULL_HANDLE;
-    eye_target.width = eye_target.height = 0;
+    if (t->fb) p_vkDestroyFramebuffer(device, t->fb, NULL);
+    if (t->view) p_vkDestroyImageView(device, t->view, NULL);
+    if (t->depth_view) p_vkDestroyImageView(device, t->depth_view, NULL);
+    if (t->image) p_vkDestroyImage(device, t->image, NULL);
+    if (t->depth) p_vkDestroyImage(device, t->depth, NULL);
+    if (t->mem) p_vkFreeMemory(device, t->mem, NULL);
+    if (t->depth_mem) p_vkFreeMemory(device, t->depth_mem, NULL);
+    memset(t, 0, sizeof(*t));
 }
 
-/* (Re)create the eye target for `want`; called on the recording thread. */
-static int eye_resources(VkExtent2D want)
+/* (Re)create target `t` at `want`; called on the recording thread. */
+static int target_resources(view_target_t *t, VkExtent2D want)
 {
     VkAttachmentDescription att[2];
     VkAttachmentReference cref = {0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
@@ -2802,14 +2815,17 @@ static int eye_resources(VkExtent2D want)
     VkFramebufferCreateInfo fci = {0};
     VkImageView views[2];
 
-    if (eye_fb && eye_target.width == want.width &&
-        eye_target.height == want.height && eye_pass_format == swap_format)
+    if (t->fb && t->extent.width == want.width &&
+        t->extent.height == want.height && eye_pass_format == swap_format)
         return 1;
     pthread_mutex_lock(&queue_mtx);
     p_vkDeviceWaitIdle(device);
     pthread_mutex_unlock(&queue_mtx);
-    eye_destroy();
+    target_destroy(t);
     if (eye_pass && eye_pass_format != swap_format) {
+        /* shortcut: the other target keeps a framebuffer of the old pass
+         * until its own size check recreates it; formats rarely change */
+        target_destroy(t == &eye_tg ? &hud_tg : &eye_tg);
         p_vkDestroyRenderPass(device, eye_pass, NULL);
         eye_pass = VK_NULL_HANDLE;
     }
@@ -2842,20 +2858,20 @@ static int eye_resources(VkExtent2D want)
             return 0;
         eye_pass_format = swap_format;
     }
-    eye_target = want;
-    if (!eye_alloc(swap_format,
-                   VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
-                       VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
-                   VK_IMAGE_ASPECT_COLOR_BIT, &eye_image, &eye_mem, &eye_view) ||
-        !eye_alloc(VK_DEPTH_FORMAT, VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT,
-                   VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT,
-                   &eye_depth, &eye_depth_mem, &eye_depth_view)) {
-        logmsg("vkskeleton: eye target allocation failed\n");
-        eye_destroy();
+    t->extent = want;
+    if (!target_alloc(t, swap_format,
+                      VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
+                          VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
+                      VK_IMAGE_ASPECT_COLOR_BIT, &t->image, &t->mem, &t->view) ||
+        !target_alloc(t, VK_DEPTH_FORMAT, VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT,
+                      VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT,
+                      &t->depth, &t->depth_mem, &t->depth_view)) {
+        logmsg("vkskeleton: view target allocation failed\n");
+        target_destroy(t);
         return 0;
     }
-    views[0] = eye_view;
-    views[1] = eye_depth_view;
+    views[0] = t->view;
+    views[1] = t->depth_view;
     fci.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
     fci.renderPass = eye_pass;
     fci.attachmentCount = 2;
@@ -2863,22 +2879,23 @@ static int eye_resources(VkExtent2D want)
     fci.width = want.width;
     fci.height = want.height;
     fci.layers = 1;
-    if (p_vkCreateFramebuffer(device, &fci, NULL, &eye_fb) != VK_SUCCESS) {
-        eye_destroy();
+    if (p_vkCreateFramebuffer(device, &fci, NULL, &t->fb) != VK_SUCCESS) {
+        target_destroy(t);
         return 0;
     }
-    logf_msg("vkskeleton: eye target %ux%u\n", want.width, want.height);
+    logf_msg("vkskeleton: %s target %ux%u\n", t == &hud_tg ? "HUD" : "eye",
+             want.width, want.height);
     return 1;
 }
 
-/* Begin (or resume after a mirror copy) the eye pass for cur_eye. */
+/* Begin (or resume after a mirror copy) the pass on cur_tg / cur_rect. */
 static void eye_begin(VkCommandBuffer cb, int clear)
 {
     VkRenderPassBeginInfo rpbi = {0};
     VkViewport vp = {0};
     VkDeviceSize offset = (VkDeviceSize)rec_slot * FRAME_VERTEX_BYTES;
 
-    image_barrier(cb, eye_image, VK_IMAGE_ASPECT_COLOR_BIT,
+    image_barrier(cb, cur_tg->image, VK_IMAGE_ASPECT_COLOR_BIT,
                   VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                   VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                   VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
@@ -2887,7 +2904,7 @@ static void eye_begin(VkCommandBuffer cb, int clear)
                   VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT |
                       VK_PIPELINE_STAGE_TRANSFER_BIT,
                   VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT);
-    image_barrier(cb, eye_depth,
+    image_barrier(cb, cur_tg->depth,
                   VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT,
                   VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
                   VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
@@ -2898,7 +2915,7 @@ static void eye_begin(VkCommandBuffer cb, int clear)
                   VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT);
     rpbi.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
     rpbi.renderPass = eye_pass;
-    rpbi.framebuffer = eye_fb;
+    rpbi.framebuffer = cur_tg->fb;
     rpbi.renderArea = cur_rect;
     p_vkCmdBeginRenderPass(cb, &rpbi, VK_SUBPASS_CONTENTS_INLINE);
     vp.x = (float)cur_rect.offset.x;
@@ -2917,14 +2934,18 @@ static void eye_begin(VkCommandBuffer cb, int clear)
         VkClearRect rect = {{{0, 0}, {0, 0}}, 0, 1};
         memset(ca, 0, sizeof(ca));
         ca[0].aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-        memcpy(ca[0].clearValue.color.float32, rec_clear_color,
-               sizeof(rec_clear_color));
+        if (cur_eye != VIEW_HUD) /* HUD: transparent */
+            memcpy(ca[0].clearValue.color.float32, rec_clear_color,
+                   sizeof(rec_clear_color));
         ca[1].aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT;
         ca[1].clearValue.depthStencil.depth = 1.0f;
         rect.rect = cur_rect;
         p_vkCmdClearAttachments(cb, 2, ca, 1, &rect);
     }
 }
+
+/* Is draw matrix `mi` a perspective (3D) one? */
+static int mat_is_3d(uint32_t mi) { return rec_mats[mi][20 + 11] < -0.5f; }
 
 /* Push constants of draw matrix `mi` for the current replay target. */
 static const float *replay_mat(uint32_t mi, float *out)
@@ -2934,7 +2955,7 @@ static const float *replay_mat(uint32_t mi, float *out)
     mat4 p, t, mv, ev;
     float l, r, d, u;
 
-    if (cur_eye < 0 || s[20 + 11] > -0.5f) /* swapchain, or 2D */
+    if (cur_eye < 0 || cur_eye == VIEW_HUD || !mat_is_3d(mi))
         return s;
     e = &rec_eyes[cur_eye];
     l = e->tan[0]; r = e->tan[1]; d = e->tan[2]; u = e->tan[3];
@@ -2955,31 +2976,39 @@ static const float *replay_mat(uint32_t mi, float *out)
     return out;
 }
 
-/* Replay the frame per eye; returns 1 if eye_image holds them. */
-static int record_eyes(VkCommandBuffer cb)
+/* Start replaying into target t (previous contents discarded). */
+static void target_start(VkCommandBuffer cb, view_target_t *t)
 {
-    VkExtent2D want;
-    int e;
-
-    if (!rec_eye_count || !rec_cmd_count || !vertex_map)
-        return 0;
-    want.width = rec_eye_extent.width * (uint32_t)rec_eye_count;
-    want.height = rec_eye_extent.height;
-    if (!eye_resources(want))
-        return 0;
-    /* contents of the previous frame are discarded */
-    image_barrier(cb, eye_image, VK_IMAGE_ASPECT_COLOR_BIT,
+    image_barrier(cb, t->image, VK_IMAGE_ASPECT_COLOR_BIT,
                   VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                   0, 0, VK_PIPELINE_STAGE_TRANSFER_BIT |
                             VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
                   VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT);
-    image_barrier(cb, eye_depth,
+    image_barrier(cb, t->depth,
                   VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT,
                   VK_IMAGE_LAYOUT_UNDEFINED,
                   VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
                   VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT, 0,
                   VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
                   VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT);
+    cur_tg = t;
+}
+
+/* Replay the frame per eye (and the HUD); returns 1 if the eye target
+ * holds the eyes, *hud set if the HUD target holds the HUD. */
+static int record_eyes(VkCommandBuffer cb, int *hud)
+{
+    VkExtent2D want;
+    int e;
+
+    *hud = 0;
+    if (!rec_eye_count || !rec_cmd_count || !vertex_map)
+        return 0;
+    want.width = rec_eye_extent.width * (uint32_t)rec_eye_count;
+    want.height = rec_eye_extent.height;
+    if (!target_resources(&eye_tg, want))
+        return 0;
+    target_start(cb, &eye_tg);
     for (e = 0; e < rec_eye_count; e++) {
         cur_eye = e;
         cur_rect.offset.x = (int32_t)(rec_eye_extent.width * (uint32_t)e);
@@ -2988,6 +3017,16 @@ static int record_eyes(VkCommandBuffer cb)
         eye_begin(cb, 1);
         replay_cmds(cb);
         p_vkCmdEndRenderPass(cb);
+    }
+    if (rec_hud && target_resources(&hud_tg, swap_extent)) {
+        target_start(cb, &hud_tg);
+        cur_eye = VIEW_HUD;
+        cur_rect.offset.x = cur_rect.offset.y = 0;
+        cur_rect.extent = swap_extent;
+        eye_begin(cb, 1);
+        replay_cmds(cb);
+        p_vkCmdEndRenderPass(cb);
+        *hud = 1;
     }
     cur_eye = -1;
     return 1;
@@ -3009,7 +3048,7 @@ static void record_framebuffer_copy(VkCommandBuffer cb, const frame_cmd_t *c)
     /* source: the swapchain, or the current eye area (scaled from GL
      * window coordinates); an eye image is already TRANSFER_SRC */
     int eye = cur_eye >= 0;
-    VkImage src = eye ? eye_image : swap_images[current_image];
+    VkImage src = eye ? cur_tg->image : swap_images[current_image];
     VkImageLayout sl = eye ? VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL
                            : VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
     float fx = (float)cur_rect.extent.width / (float)W;
@@ -3169,7 +3208,7 @@ static void replay_cmds(VkCommandBuffer cb)
                 uint32_t n = 0;
                 memset(ca, 0, sizeof(ca));
                 rect.rect = cur_rect;
-                if (c->mask & GL_COLOR_BUFFER_BIT) {
+                if ((c->mask & GL_COLOR_BUFFER_BIT) && cur_eye != VIEW_HUD) {
                     ca[n].aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
                     ca[n].colorAttachment = 0;
                     memcpy(ca[n].clearValue.color.float32, c->color,
@@ -3190,6 +3229,8 @@ static void replay_cmds(VkCommandBuffer cb)
                 continue;
             }
             if (c->type == FCMD_COPY) {
+                if (cur_eye == VIEW_HUD)
+                    continue; /* mirrors are 3D */
                 record_framebuffer_copy(cb, c);
                 /* new render pass: rebind everything */
                 p_vkCmdBindVertexBuffers(cb, 0, 1, &vertex_buffer, &offset);
@@ -3204,6 +3245,14 @@ static void replay_cmds(VkCommandBuffer cb)
                 const frame_batch_t *b = &rec_batches[c->a];
                 VkDescriptorSet sets[2];
                 uint32_t slot2 = b->tex2;
+                uint32_t pkey = b->pkey;
+
+                /* separate HUD: 2D only in the HUD target, 3D only in eyes */
+                if (rec_hud && cur_eye >= 0 &&
+                    mat_is_3d(b->mat) != (cur_eye != VIEW_HUD))
+                    continue;
+                if (cur_eye == VIEW_HUD)
+                    pkey |= PKEY_HUD_ALPHA;
 
                 if (b->mat != last_mat) {
                     p_vkCmdPushConstants(cb, pipeline_layout,
@@ -3224,7 +3273,7 @@ static void replay_cmds(VkCommandBuffer cb)
                 sets[1] = vk_textures[slot2].desc_set;
                 vk_textures[slot].last_used_serial = frame_serial + 1;
                 vk_textures[slot2].last_used_serial = frame_serial + 1;
-                pipe = get_pipeline(b->pkey);
+                pipe = get_pipeline(pkey);
                 if (!pipe)
                     continue;
                 p_vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
@@ -3253,12 +3302,12 @@ static int end_frame_present(void)
 
     p_vkCmdEndRenderPass(cmd_buffers[rec_slot]);
     {
-        int eyes = record_eyes(cmd_buffers[rec_slot]);
+        int hud, eyes = record_eyes(cmd_buffers[rec_slot], &hud);
         if (vkx_frame_end && swap_can_copy)
             vkx_frame_end(cmd_buffers[rec_slot], swap_images[current_image],
                           swap_format, swap_extent, frame_fences[rec_slot],
-                          rec_proj_tan, eyes ? eye_image : VK_NULL_HANDLE,
-                          eye_target);
+                          rec_proj_tan, eyes ? eye_tg.image : VK_NULL_HANDLE,
+                          eye_tg.extent, hud ? hud_tg.image : VK_NULL_HANDLE);
     }
     p_vkEndCommandBuffer(cmd_buffers[rec_slot]);
 
@@ -5087,6 +5136,7 @@ static int submit_frame(void)
     memcpy(rec_clear_color, clear_color, sizeof(rec_clear_color));
     memcpy(rec_proj_tan, last_proj_tan, sizeof(rec_proj_tan));
     rec_eye_count = vkx_eyes ? vkx_eyes(&rec_eye_extent, rec_eyes) : 0;
+    rec_hud = rec_eye_count && vkx_hud && vkx_hud();
     if (rec_eye_count < 0 || rec_eye_count > 2 || !rec_eye_extent.width ||
         !rec_eye_extent.height || rec_eye_extent.width > 8192 ||
         rec_eye_extent.height > 8192)
@@ -5196,6 +5246,8 @@ static void vk_CL_CreateMove(float frametime, void *cmd, int active)
 
     if (real_cl_createmove)
         real_cl_createmove(frametime, cmd, active);
+    if (vkx_create_move && cmd)
+        vkx_create_move(frametime, cmd, active);
     if (!logged) {
         logged = 1;
         logmsg("vkskeleton: freecam: CL_CreateMove hook active\n");

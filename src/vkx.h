@@ -24,13 +24,16 @@ __attribute__((weak)) void vkx_on_device(VkInstance instance,
  * `proj_tan` = {left, right, down, up} tangents of the last perspective
  * projection used this frame (0 if none).  `eye_image` is VK_NULL_HANDLE, or
  * the eye views asked for by vkx_eyes, side by side (`eye_target` in total),
- * format `format`, layout TRANSFER_SRC_OPTIMAL (leave it so). */
+ * format `format`, layout TRANSFER_SRC_OPTIMAL (leave it so).  `hud_image`
+ * (same format/layout, size `extent`) is VK_NULL_HANDLE or the HUD asked
+ * for by vkx_hud. */
 __attribute__((weak)) void vkx_frame_end(VkCommandBuffer cb, VkImage swap_image,
                                          VkFormat format, VkExtent2D extent,
                                          VkFence fence,
                                          const float proj_tan[4],
                                          VkImage eye_image,
-                                         VkExtent2D eye_target);
+                                         VkExtent2D eye_target,
+                                         VkImage hud_image);
 
 /* Eye views.  Called on the game thread when a frame is handed to the GPU.
  * Return 0, 1 or 2: the frame is replayed that many extra times, eye i into
@@ -43,6 +46,16 @@ typedef struct vkx_eye {
     float eye[16];
 } vkx_eye_t;
 __attribute__((weak)) int vkx_eyes(VkExtent2D *eye_extent, vkx_eye_t eyes[2]);
+
+/* With eye views: return nonzero to get the HUD separately.  The eyes then
+ * get only the 3D draws, and the 2D draws are replayed into a window-sized
+ * HUD image: transparent background, premultiplied alpha, additive draws
+ * add light (alpha unchanged). */
+__attribute__((weak)) int vkx_hud(void);
+
+/* After the game's CL_CreateMove filled `cmd` (HL SDK usercmd_t). */
+__attribute__((weak)) void vkx_create_move(float frametime, void *cmd,
+                                           int active);
 
 /* View hook: called inside the V_CalcRefdef wrapper after the game computed
  * its view.  `ref_params` is the HL SDK ref_params_t (vieworg floats 0-2,
