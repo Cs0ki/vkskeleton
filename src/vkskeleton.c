@@ -336,8 +336,12 @@ typedef struct {
     float bias_s, bias_c;   /* depth bias slope/constant (dynamic state) */
 } frame_batch_t;
 #define MAX_FRAME_MATS 65536
-static float frame_mats_store[FRAMES_IN_FLIGHT][MAX_FRAME_MATS][20];
-static float (*frame_mats)[20] = frame_mats_store[0]; /* mvp + clip plane */
+/* Per draw: [0-15] final mvp, [16-19] clip plane (both pushed to the
+ * shader), [20-35] GL projection, [36-51] modelview, [52-53] depth-range
+ * a,b: the parts vkx eye views rebuild the mvp from. */
+#define MAT_FLOATS 56
+static float frame_mats_store[FRAMES_IN_FLIGHT][MAX_FRAME_MATS][MAT_FLOATS];
+static float (*frame_mats)[MAT_FLOATS] = frame_mats_store[0];
 static uint32_t frame_mat_count;
 static uint32_t cur_draw_mat;
 #define MAX_FRAME_BATCHES 65536
@@ -427,7 +431,14 @@ static uint32_t rec_slot;
 static frame_cmd_t *rec_cmds;
 static uint32_t rec_cmd_count;
 static frame_batch_t *rec_batches;
-static float (*rec_mats)[20];
+static float (*rec_mats)[MAT_FLOATS];
+/* vkx eye views: the finished frame is replayed once per eye, side by side,
+ * into eye_image (see vkx_eyes in vkx.h). */
+static int rec_eye_count;
+static VkExtent2D rec_eye_extent;
+static vkx_eye_t rec_eyes[2];
+static int cur_eye = -1;          /* replay target: -1 swapchain, else eye */
+static VkRect2D cur_rect;         /* replay target area */
 static size_t rec_vertex_count;
 static int rec_has_upload;
 static float rec_clear_color[4];
@@ -570,6 +581,7 @@ PFN(DestroySwapchainKHR);
 PFN(DeviceWaitIdle);
 PFN(CmdSetViewport);
 PFN(CmdSetScissor);
+PFN(DestroyRenderPass);
 PFN(CmdPushConstants);
 PFN(CmdBlitImage);
 PFN(CmdClearAttachments);
@@ -2265,6 +2277,7 @@ static int init_vulkan(Display *dpy, Window win)
     LOAD_DEVICE(DeviceWaitIdle);
     LOAD_DEVICE(CmdSetViewport);
     LOAD_DEVICE(CmdSetScissor);
+    LOAD_DEVICE(DestroyRenderPass);
     LOAD_DEVICE(CmdPushConstants);
     LOAD_DEVICE(CmdBlitImage);
     LOAD_DEVICE(CmdClearAttachments);
@@ -2705,6 +2718,281 @@ static void image_barrier(VkCommandBuffer cb, VkImage image,
     p_vkCmdPipelineBarrier(cb, src_stage, dst_stage, 0, 0, NULL, 0, NULL, 1, &b);
 }
 
+/* ---------- vkx eye views ----------
+ * After the main pass, the frame's command list is replayed once per eye
+ * into eye_image (eyes side by side) with an eye depth buffer, through a
+ * render pass compatible with render_pass (same formats), so the pipelines
+ * are shared.  Colour stays in TRANSFER_SRC_OPTIMAL between passes (blit
+ * source for mirror copies and for the module). */
+static VkRenderPass eye_pass;
+static VkFormat eye_pass_format;
+static VkImage eye_image, eye_depth;
+static VkDeviceMemory eye_mem, eye_depth_mem;
+static VkImageView eye_view, eye_depth_view;
+static VkFramebuffer eye_fb;
+static VkExtent2D eye_target;
+static void fix_clip(const float *m, float a, float b, float *o);
+static void replay_cmds(VkCommandBuffer cb);
+
+static int eye_alloc(VkFormat fmt, VkImageUsageFlags usage,
+                     VkImageAspectFlags aspect, VkImage *img,
+                     VkDeviceMemory *mem, VkImageView *view)
+{
+    VkImageCreateInfo ci = {0};
+    VkImageViewCreateInfo vi = {0};
+    VkMemoryAllocateInfo ai = {0};
+    VkMemoryRequirements req;
+
+    ci.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+    ci.imageType = VK_IMAGE_TYPE_2D;
+    ci.format = fmt;
+    ci.extent.width = eye_target.width;
+    ci.extent.height = eye_target.height;
+    ci.extent.depth = 1;
+    ci.mipLevels = 1;
+    ci.arrayLayers = 1;
+    ci.samples = VK_SAMPLE_COUNT_1_BIT;
+    ci.tiling = VK_IMAGE_TILING_OPTIMAL;
+    ci.usage = usage;
+    ci.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    if (p_vkCreateImage(device, &ci, NULL, img) != VK_SUCCESS)
+        return 0;
+    p_vkGetImageMemoryRequirements(device, *img, &req);
+    ai.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+    ai.allocationSize = req.size;
+    ai.memoryTypeIndex = find_memory_type(req, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    if (ai.memoryTypeIndex == ~0u ||
+        p_vkAllocateMemory(device, &ai, NULL, mem) != VK_SUCCESS ||
+        p_vkBindImageMemory(device, *img, *mem, 0) != VK_SUCCESS)
+        return 0;
+    vi.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+    vi.image = *img;
+    vi.viewType = VK_IMAGE_VIEW_TYPE_2D;
+    vi.format = fmt;
+    vi.subresourceRange.aspectMask = aspect;
+    vi.subresourceRange.levelCount = 1;
+    vi.subresourceRange.layerCount = 1;
+    return p_vkCreateImageView(device, &vi, NULL, view) == VK_SUCCESS;
+}
+
+static void eye_destroy(void)
+{
+    if (eye_fb) p_vkDestroyFramebuffer(device, eye_fb, NULL);
+    if (eye_view) p_vkDestroyImageView(device, eye_view, NULL);
+    if (eye_depth_view) p_vkDestroyImageView(device, eye_depth_view, NULL);
+    if (eye_image) p_vkDestroyImage(device, eye_image, NULL);
+    if (eye_depth) p_vkDestroyImage(device, eye_depth, NULL);
+    if (eye_mem) p_vkFreeMemory(device, eye_mem, NULL);
+    if (eye_depth_mem) p_vkFreeMemory(device, eye_depth_mem, NULL);
+    eye_fb = VK_NULL_HANDLE;
+    eye_view = eye_depth_view = VK_NULL_HANDLE;
+    eye_image = eye_depth = VK_NULL_HANDLE;
+    eye_mem = eye_depth_mem = VK_NULL_HANDLE;
+    eye_target.width = eye_target.height = 0;
+}
+
+/* (Re)create the eye target for `want`; called on the recording thread. */
+static int eye_resources(VkExtent2D want)
+{
+    VkAttachmentDescription att[2];
+    VkAttachmentReference cref = {0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
+    VkAttachmentReference dref = {1, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL};
+    VkSubpassDescription sub = {0};
+    VkRenderPassCreateInfo rpci = {0};
+    VkFramebufferCreateInfo fci = {0};
+    VkImageView views[2];
+
+    if (eye_fb && eye_target.width == want.width &&
+        eye_target.height == want.height && eye_pass_format == swap_format)
+        return 1;
+    pthread_mutex_lock(&queue_mtx);
+    p_vkDeviceWaitIdle(device);
+    pthread_mutex_unlock(&queue_mtx);
+    eye_destroy();
+    if (eye_pass && eye_pass_format != swap_format) {
+        p_vkDestroyRenderPass(device, eye_pass, NULL);
+        eye_pass = VK_NULL_HANDLE;
+    }
+    if (!eye_pass) {
+        memset(att, 0, sizeof(att));
+        att[0].format = swap_format;
+        att[0].samples = VK_SAMPLE_COUNT_1_BIT;
+        att[0].loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+        att[0].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+        att[0].stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+        att[0].stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+        att[0].initialLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+        att[0].finalLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+        att[1] = att[0];
+        att[1].format = VK_DEPTH_FORMAT;
+        att[1].stencilLoadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+        att[1].stencilStoreOp = VK_ATTACHMENT_STORE_OP_STORE;
+        att[1].initialLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+        att[1].finalLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+        sub.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
+        sub.colorAttachmentCount = 1;
+        sub.pColorAttachments = &cref;
+        sub.pDepthStencilAttachment = &dref;
+        rpci.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
+        rpci.attachmentCount = 2;
+        rpci.pAttachments = att;
+        rpci.subpassCount = 1;
+        rpci.pSubpasses = &sub;
+        if (p_vkCreateRenderPass(device, &rpci, NULL, &eye_pass) != VK_SUCCESS)
+            return 0;
+        eye_pass_format = swap_format;
+    }
+    eye_target = want;
+    if (!eye_alloc(swap_format,
+                   VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
+                       VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
+                   VK_IMAGE_ASPECT_COLOR_BIT, &eye_image, &eye_mem, &eye_view) ||
+        !eye_alloc(VK_DEPTH_FORMAT, VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT,
+                   VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT,
+                   &eye_depth, &eye_depth_mem, &eye_depth_view)) {
+        logmsg("vkskeleton: eye target allocation failed\n");
+        eye_destroy();
+        return 0;
+    }
+    views[0] = eye_view;
+    views[1] = eye_depth_view;
+    fci.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
+    fci.renderPass = eye_pass;
+    fci.attachmentCount = 2;
+    fci.pAttachments = views;
+    fci.width = want.width;
+    fci.height = want.height;
+    fci.layers = 1;
+    if (p_vkCreateFramebuffer(device, &fci, NULL, &eye_fb) != VK_SUCCESS) {
+        eye_destroy();
+        return 0;
+    }
+    logf_msg("vkskeleton: eye target %ux%u\n", want.width, want.height);
+    return 1;
+}
+
+/* Begin (or resume after a mirror copy) the eye pass for cur_eye. */
+static void eye_begin(VkCommandBuffer cb, int clear)
+{
+    VkRenderPassBeginInfo rpbi = {0};
+    VkViewport vp = {0};
+    VkDeviceSize offset = (VkDeviceSize)rec_slot * FRAME_VERTEX_BYTES;
+
+    image_barrier(cb, eye_image, VK_IMAGE_ASPECT_COLOR_BIT,
+                  VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                  VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                  VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+                  VK_ACCESS_COLOR_ATTACHMENT_READ_BIT |
+                      VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+                  VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT |
+                      VK_PIPELINE_STAGE_TRANSFER_BIT,
+                  VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT);
+    image_barrier(cb, eye_depth,
+                  VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT,
+                  VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+                  VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+                  VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
+                  VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT |
+                      VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
+                  VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
+                  VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT);
+    rpbi.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
+    rpbi.renderPass = eye_pass;
+    rpbi.framebuffer = eye_fb;
+    rpbi.renderArea = cur_rect;
+    p_vkCmdBeginRenderPass(cb, &rpbi, VK_SUBPASS_CONTENTS_INLINE);
+    vp.x = (float)cur_rect.offset.x;
+    vp.y = (float)cur_rect.offset.y;
+    vp.width = (float)cur_rect.extent.width;
+    vp.height = (float)cur_rect.extent.height;
+    vp.maxDepth = 1.0f;
+    p_vkCmdSetViewport(cb, 0, 1, &vp);
+    p_vkCmdSetScissor(cb, 0, 1, &cur_rect);
+    p_vkCmdBindVertexBuffers(cb, 0, 1, &vertex_buffer, &offset);
+    p_vkCmdBindIndexBuffer(cb, index_buffer,
+                           (VkDeviceSize)rec_slot * FRAME_INDEX_BYTES,
+                           VK_INDEX_TYPE_UINT32);
+    if (clear) { /* what render_pass's CLEAR load does for the swapchain */
+        VkClearAttachment ca[2];
+        VkClearRect rect = {{{0, 0}, {0, 0}}, 0, 1};
+        memset(ca, 0, sizeof(ca));
+        ca[0].aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        memcpy(ca[0].clearValue.color.float32, rec_clear_color,
+               sizeof(rec_clear_color));
+        ca[1].aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT;
+        ca[1].clearValue.depthStencil.depth = 1.0f;
+        rect.rect = cur_rect;
+        p_vkCmdClearAttachments(cb, 2, ca, 1, &rect);
+    }
+}
+
+/* Push constants of draw matrix `mi` for the current replay target. */
+static const float *replay_mat(uint32_t mi, float *out)
+{
+    const float *s = rec_mats[mi];
+    const vkx_eye_t *e;
+    mat4 p, t, mv, ev;
+    float l, r, d, u;
+
+    if (cur_eye < 0 || s[20 + 11] > -0.5f) /* swapchain, or 2D */
+        return s;
+    e = &rec_eyes[cur_eye];
+    l = e->tan[0]; r = e->tan[1]; d = e->tan[2]; u = e->tan[3];
+    memset(&p, 0, sizeof(p));
+    p.m[0] = 2.0f / (r - l);
+    p.m[5] = 2.0f / (u - d);
+    p.m[8] = (r + l) / (r - l);
+    p.m[9] = (u + d) / (u - d);
+    p.m[10] = s[20 + 10]; /* the game's near/far mapping */
+    p.m[11] = -1.0f;
+    p.m[14] = s[20 + 14];
+    memcpy(mv.m, s + 36, sizeof(mv.m));
+    memcpy(ev.m, e->eye, sizeof(ev.m));
+    mat_mul(&t, &ev, &mv);
+    mat_mul(&t, &p, &t);
+    fix_clip(t.m, s[52], s[53], out);
+    memcpy(out + 16, s + 16, 4 * sizeof(float));
+    return out;
+}
+
+/* Replay the frame per eye; returns 1 if eye_image holds them. */
+static int record_eyes(VkCommandBuffer cb)
+{
+    VkExtent2D want;
+    int e;
+
+    if (!rec_eye_count || !rec_cmd_count || !vertex_map)
+        return 0;
+    want.width = rec_eye_extent.width * (uint32_t)rec_eye_count;
+    want.height = rec_eye_extent.height;
+    if (!eye_resources(want))
+        return 0;
+    /* contents of the previous frame are discarded */
+    image_barrier(cb, eye_image, VK_IMAGE_ASPECT_COLOR_BIT,
+                  VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                  0, 0, VK_PIPELINE_STAGE_TRANSFER_BIT |
+                            VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                  VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT);
+    image_barrier(cb, eye_depth,
+                  VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT,
+                  VK_IMAGE_LAYOUT_UNDEFINED,
+                  VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+                  VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT, 0,
+                  VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
+                  VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT);
+    for (e = 0; e < rec_eye_count; e++) {
+        cur_eye = e;
+        cur_rect.offset.x = (int32_t)(rec_eye_extent.width * (uint32_t)e);
+        cur_rect.offset.y = 0;
+        cur_rect.extent = rec_eye_extent;
+        eye_begin(cb, 1);
+        replay_cmds(cb);
+        p_vkCmdEndRenderPass(cb);
+    }
+    cur_eye = -1;
+    return 1;
+}
+
 /* glCopyTexSubImage2D: end the render pass, blit the swapchain image into
  * the texture, resume in a LOAD render pass.  GL framebuffer rows run
  * bottom-up while the Vulkan image is top-down; textures keep GL row order,
@@ -2718,6 +3006,15 @@ static void record_framebuffer_copy(VkCommandBuffer cb, const frame_cmd_t *c)
     VkRenderPassBeginInfo rpbi = {0};
     VkViewport vp = {0};
     VkRect2D sc = {{0, 0}, {0, 0}};
+    /* source: the swapchain, or the current eye area (scaled from GL
+     * window coordinates); an eye image is already TRANSFER_SRC */
+    int eye = cur_eye >= 0;
+    VkImage src = eye ? eye_image : swap_images[current_image];
+    VkImageLayout sl = eye ? VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL
+                           : VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+    float fx = (float)cur_rect.extent.width / (float)W;
+    float fy = (float)cur_rect.extent.height / (float)H;
+    int32_t ox = cur_rect.offset.x, oy = cur_rect.offset.y;
 
     p_vkCmdEndRenderPass(cb);
 
@@ -2729,8 +3026,7 @@ static void record_framebuffer_copy(VkCommandBuffer cb, const frame_cmd_t *c)
     if (tex->image && c->dy + h > (int32_t)tex->height) h = (int32_t)tex->height - c->dy;
 
     if (tex->image && w > 0 && h > 0) {
-        image_barrier(cb, swap_images[current_image], VK_IMAGE_ASPECT_COLOR_BIT,
-                      VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+        image_barrier(cb, src, VK_IMAGE_ASPECT_COLOR_BIT, sl,
                       VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                       VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
                       VK_ACCESS_TRANSFER_READ_BIT,
@@ -2745,11 +3041,11 @@ static void record_framebuffer_copy(VkCommandBuffer cb, const frame_cmd_t *c)
                       VK_PIPELINE_STAGE_TRANSFER_BIT);
         blit.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
         blit.srcSubresource.layerCount = 1;
-        blit.srcOffsets[0].x = c->sx;
-        blit.srcOffsets[0].y = H - c->sy;       /* GL bottom row */
+        blit.srcOffsets[0].x = ox + (int32_t)((float)c->sx * fx);
+        blit.srcOffsets[0].y = oy + (int32_t)((float)(H - c->sy) * fy); /* GL bottom row */
         blit.srcOffsets[0].z = 0;
-        blit.srcOffsets[1].x = c->sx + w;
-        blit.srcOffsets[1].y = H - c->sy - h;   /* GL top row */
+        blit.srcOffsets[1].x = ox + (int32_t)((float)(c->sx + w) * fx);
+        blit.srcOffsets[1].y = oy + (int32_t)((float)(H - c->sy - h) * fy); /* GL top row */
         blit.srcOffsets[1].z = 1;
         blit.dstSubresource = blit.srcSubresource;
         blit.dstOffsets[0].x = c->dx;
@@ -2757,7 +3053,7 @@ static void record_framebuffer_copy(VkCommandBuffer cb, const frame_cmd_t *c)
         blit.dstOffsets[1].x = c->dx + w;
         blit.dstOffsets[1].y = c->dy + h;
         blit.dstOffsets[1].z = 1;
-        p_vkCmdBlitImage(cb, swap_images[current_image],
+        p_vkCmdBlitImage(cb, src,
                          VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, tex->image,
                          VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit,
                          VK_FILTER_NEAREST);
@@ -2767,9 +3063,8 @@ static void record_framebuffer_copy(VkCommandBuffer cb, const frame_cmd_t *c)
                       VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
                       VK_PIPELINE_STAGE_TRANSFER_BIT,
                       VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
-        image_barrier(cb, swap_images[current_image], VK_IMAGE_ASPECT_COLOR_BIT,
-                      VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                      VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+        image_barrier(cb, src, VK_IMAGE_ASPECT_COLOR_BIT,
+                      VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, sl,
                       VK_ACCESS_TRANSFER_READ_BIT,
                       VK_ACCESS_COLOR_ATTACHMENT_READ_BIT |
                           VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
@@ -2777,7 +3072,12 @@ static void record_framebuffer_copy(VkCommandBuffer cb, const frame_cmd_t *c)
                       VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT);
         tex->valid = 1;
         tex->last_used_serial = frame_serial + 1;
-    } else {
+    }
+    if (eye) {
+        eye_begin(cb, 0);
+        return;
+    }
+    if (!(tex->image && w > 0 && h > 0)) {
         /* nothing copied: still make the colour writes visible to the
          * next (LOAD) pass, layout unchanged */
         image_barrier(cb, swap_images[current_image], VK_IMAGE_ASPECT_COLOR_BIT,
@@ -2816,16 +3116,10 @@ static void record_framebuffer_copy(VkCommandBuffer cb, const frame_cmd_t *c)
 static void record_frame_vertices(void)
 {
     VkDeviceSize offset = 0;
-    VkPipeline pipe;
-    size_t bytes;
-    size_t i, j;
-    uint32_t slot;
     int k;
 
     if (!frame_active || !rec_cmd_count || !vertex_map)
         return;
-    (void)bytes;
-    (void)j;
     offset = (VkDeviceSize)rec_slot * FRAME_VERTEX_BYTES;
 
     if (!logged_first_draw) {
@@ -2848,9 +3142,21 @@ static void record_frame_vertices(void)
     p_vkCmdBindIndexBuffer(cmd_buffers[rec_slot], index_buffer,
                            (VkDeviceSize)rec_slot * FRAME_INDEX_BYTES,
                            VK_INDEX_TYPE_UINT32);
+    cur_eye = -1;
+    cur_rect.offset.x = cur_rect.offset.y = 0;
+    cur_rect.extent = swap_extent;
+    replay_cmds(cmd_buffers[rec_slot]);
+}
+
+/* Record the frame's command list into the current target (cur_eye). */
+static void replay_cmds(VkCommandBuffer cb)
+{
+    VkDeviceSize offset = (VkDeviceSize)rec_slot * FRAME_VERTEX_BYTES;
+    VkPipeline pipe;
+    uint32_t slot;
+    float eye_pc[20];
 
     {
-        VkCommandBuffer cb = cmd_buffers[rec_slot];
         uint32_t last_mat = ~0u;
         uint32_t ci;
 
@@ -2862,7 +3168,7 @@ static void record_frame_vertices(void)
                 VkClearRect rect = {{{0, 0}, {0, 0}}, 0, 1};
                 uint32_t n = 0;
                 memset(ca, 0, sizeof(ca));
-                rect.rect.extent = swap_extent;
+                rect.rect = cur_rect;
                 if (c->mask & GL_COLOR_BUFFER_BIT) {
                     ca[n].aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
                     ca[n].colorAttachment = 0;
@@ -2902,7 +3208,7 @@ static void record_frame_vertices(void)
                 if (b->mat != last_mat) {
                     p_vkCmdPushConstants(cb, pipeline_layout,
                                          VK_SHADER_STAGE_VERTEX_BIT, 0, 80,
-                                         rec_mats[b->mat]);
+                                         replay_mat(b->mat, eye_pc));
                     last_mat = b->mat;
                 }
                 slot = b->tex;
@@ -2933,7 +3239,6 @@ static void record_frame_vertices(void)
             }
         }
     }
-    (void)i;
 }
 
 static int end_frame_present(void)
@@ -2947,10 +3252,14 @@ static int end_frame_present(void)
         return 0;
 
     p_vkCmdEndRenderPass(cmd_buffers[rec_slot]);
-    if (vkx_frame_end && swap_can_copy)
-        vkx_frame_end(cmd_buffers[rec_slot], swap_images[current_image],
-                      swap_format, swap_extent, frame_fences[rec_slot],
-                      rec_proj_tan);
+    {
+        int eyes = record_eyes(cmd_buffers[rec_slot]);
+        if (vkx_frame_end && swap_can_copy)
+            vkx_frame_end(cmd_buffers[rec_slot], swap_images[current_image],
+                          swap_format, swap_extent, frame_fences[rec_slot],
+                          rec_proj_tan, eyes ? eye_image : VK_NULL_HANDLE,
+                          eye_target);
+    }
     p_vkEndCommandBuffer(cmd_buffers[rec_slot]);
 
     si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
@@ -3075,20 +3384,31 @@ static void batch_add_tri(const im_vertex_t *s)
  *                                 inside Vulkan's [0,w])
  * Returns the matrix index for this draw, reusing the previous one when
  * unchanged (world and studio models share one matrix in GoldSrc). */
-static uint32_t frame_matrix_for_draw(void)
+/* GL clip space -> Vulkan: flip Y, apply glDepthRange (z' = a*z + b*w). */
+static void fix_clip(const float *m, float a, float b, float *o)
 {
-    const float *m = mat_mvp.m;
-    float o[20];
-    float a = (depth_range_far - depth_range_near) * 0.5f;
-    float b = (depth_range_far + depth_range_near) * 0.5f;
     int c;
-
     for (c = 0; c < 4; c++) {
         o[c * 4 + 0] = m[c * 4 + 0];
         o[c * 4 + 1] = -m[c * 4 + 1];
         o[c * 4 + 2] = a * m[c * 4 + 2] + b * m[c * 4 + 3];
         o[c * 4 + 3] = m[c * 4 + 3];
     }
+}
+
+static uint32_t frame_matrix_for_draw(void)
+{
+    float o[MAT_FLOATS];
+    float a = (depth_range_far - depth_range_near) * 0.5f;
+    float b = (depth_range_far + depth_range_near) * 0.5f;
+    int c;
+
+    fix_clip(mat_mvp.m, a, b, o);
+    memcpy(o + 20, mat_proj.m, 16 * sizeof(float));
+    memcpy(o + 36, mat_model.m, 16 * sizeof(float));
+    o[52] = a;
+    o[53] = b;
+    o[54] = o[55] = 0.0f;
     /* glClipPlane: the eye-space plane, expressed in this draw's object
      * space (plane_obj = plane_eye * ModelView), so the vertex shader can
      * use the untransformed position: gl_ClipDistance = dot(plane, pos). */
@@ -4766,6 +5086,11 @@ static int submit_frame(void)
     rec_vertex_count = frame_vertex_count;
     memcpy(rec_clear_color, clear_color, sizeof(rec_clear_color));
     memcpy(rec_proj_tan, last_proj_tan, sizeof(rec_proj_tan));
+    rec_eye_count = vkx_eyes ? vkx_eyes(&rec_eye_extent, rec_eyes) : 0;
+    if (rec_eye_count < 0 || rec_eye_count > 2 || !rec_eye_extent.width ||
+        !rec_eye_extent.height || rec_eye_extent.width > 8192 ||
+        rec_eye_extent.height > 8192)
+        rec_eye_count = 0;
 
     if (render_thread_started) {
         pthread_mutex_lock(&rt_mtx);
