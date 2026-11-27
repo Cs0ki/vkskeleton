@@ -19,7 +19,7 @@
 set -uo pipefail
 
 REPO="$(cd "$(dirname "$0")" && pwd)"
-SRC="$REPO/build/vkskeleton.so"
+SRC="${VKSKELETON_LIB:-$REPO/build/vkskeleton.so}"   # VKSKELETON_LIB: e.g. a build with vkx modules
 TMP="${TMPDIR:-/tmp}"
 LIB="$TMP/vkskeleton-play.so"
 STDOUT_LOG="$TMP/vk-play-stdout.log"

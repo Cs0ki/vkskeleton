@@ -28,6 +28,7 @@
 #include <pthread.h>
 
 #include "shaders_spirv.h"
+#include "vkx.h"
 
 typedef void *(*dlsym_t)(void *, const char *);
 typedef __GLXextFuncPtr (*getproc_t)(const GLubyte *);
@@ -430,6 +431,8 @@ static float (*rec_mats)[20];
 static size_t rec_vertex_count;
 static int rec_has_upload;
 static float rec_clear_color[4];
+static float last_proj_tan[4];   /* game side: last perspective projection */
+static float rec_proj_tan[4];    /* snapshot for vkx_frame_end */
 /* Opt-in render thread (VKSKELETON_RENDER_THREAD=1). */
 static int render_thread_enabled;
 static pthread_t render_thread;
@@ -2108,7 +2111,7 @@ static int init_vulkan(Display *dpy, Window win)
     app.applicationVersion = 1;
     app.pEngineName = "vkskeleton";
     app.engineVersion = 1;
-    app.apiVersion = VK_API_VERSION_1_0;
+    app.apiVersion = VK_API_VERSION_1_1; /* external memory core (vkx modules) */
     ici.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
    ici.pApplicationInfo = &app;
     ici.enabledExtensionCount = 2;
@@ -2176,8 +2179,18 @@ static int init_vulkan(Display *dpy, Window win)
     dci.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
     dci.queueCreateInfoCount = 1;
     dci.pQueueCreateInfos = &qci;
-    dci.enabledExtensionCount = 1;
-    dci.ppEnabledExtensionNames = dev_exts;
+    {
+        /* swapchain + whatever a linked vkx module asks for */
+        static const char *all_exts[16];
+        uint32_t n = 0;
+        const char *const *extra = vkx_device_extensions ? vkx_device_extensions()
+                                                         : NULL;
+        all_exts[n++] = dev_exts[0];
+        while (extra && *extra && n < 16)
+            all_exts[n++] = *extra++;
+        dci.enabledExtensionCount = n;
+        dci.ppEnabledExtensionNames = all_exts;
+    }
     {
         /* gl_ClipDistance emulates glClipPlane (mirrors cut away what is
          * behind the mirror plane). */
@@ -2258,6 +2271,9 @@ static int init_vulkan(Display *dpy, Window win)
     LOAD_DEVICE(CmdSetStencilReference);
     LOAD_DEVICE(CmdSetDepthBias);
     logmsg("vkskeleton: device procs ready\n");
+    if (vkx_on_device)
+        vkx_on_device(instance, physdev, device, queue, chosen,
+                      fp_vkGetDeviceProcAddr);
 
     r = p_vkGetPhysicalDeviceSurfaceCapabilitiesKHR(physdev, surface, &caps);
     if (r != VK_SUCCESS) {
@@ -2931,6 +2947,10 @@ static int end_frame_present(void)
         return 0;
 
     p_vkCmdEndRenderPass(cmd_buffers[rec_slot]);
+    if (vkx_frame_end && swap_can_copy)
+        vkx_frame_end(cmd_buffers[rec_slot], swap_images[current_image],
+                      swap_format, swap_extent, frame_fences[rec_slot],
+                      rec_proj_tan);
     p_vkEndCommandBuffer(cmd_buffers[rec_slot]);
 
     si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
@@ -3148,6 +3168,15 @@ static void append_geometry(void)
             cur_draw_mat == ~0u) {
             mat_mul(&mat_mvp, &mat_proj, &mat_model);
             cur_draw_mat = frame_matrix_for_draw();
+            if (mat_proj.m[11] < -0.5f && mat_proj.m[0] != 0.0f &&
+                mat_proj.m[5] != 0.0f) {
+                /* glFrustum: tangents of the left/right/down/up planes */
+                const float *m = mat_proj.m;
+                last_proj_tan[0] = (m[8] - 1.0f) / m[0];
+                last_proj_tan[1] = (m[8] + 1.0f) / m[0];
+                last_proj_tan[2] = (m[9] - 1.0f) / m[5];
+                last_proj_tan[3] = (m[9] + 1.0f) / m[5];
+            }
             done_xform = xform_serial;
             done_epoch = frame_epoch;
         }
@@ -4736,6 +4765,7 @@ static int submit_frame(void)
     rec_mats = frame_mats;
     rec_vertex_count = frame_vertex_count;
     memcpy(rec_clear_color, clear_color, sizeof(rec_clear_color));
+    memcpy(rec_proj_tan, last_proj_tan, sizeof(rec_proj_tan));
 
     if (render_thread_started) {
         pthread_mutex_lock(&rt_mtx);
@@ -4941,6 +4971,8 @@ static void vk_V_CalcRefdef(void *pparams)
             logmsg("vkskeleton: freecam: V_CalcRefdef hook active\n");
         }
     }
+    if (vkx_view && p)
+        vkx_view(p);
     freecam_poll_keys();
     if (!fc_active || !p)
         return;
