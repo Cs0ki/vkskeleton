@@ -19,7 +19,7 @@ if command -v spirv-val >/dev/null 2>&1; then
 import re, sys
 from pathlib import Path
 text = Path("src/shaders_spirv.h").read_text()
-for name in ("vk_vertex_spirv", "vk_fragment_spirv"):
+for name in ("vk_vertex_spirv", "vk_fragment_spirv", "vk_skin_vertex_spirv"):
     body = re.search(r"static const uint32_t " + name + r"\[\] = \{(.*?)\};",
                      text, re.S).group(1)
     words = [int(w, 16) for w in re.findall(r"0x[0-9a-fA-F]+", body)]
@@ -28,6 +28,7 @@ for name in ("vk_vertex_spirv", "vk_fragment_spirv"):
 PY
     spirv-val --target-env vulkan1.0 "$tmp/vk_vertex_spirv.spv"
     spirv-val --target-env vulkan1.0 "$tmp/vk_fragment_spirv.spv"
+    spirv-val --target-env vulkan1.0 "$tmp/vk_skin_vertex_spirv.spv"
     echo "SPIR-V validation: OK"
 else
     echo "SPIR-V validation: skipped (spirv-val not installed)"

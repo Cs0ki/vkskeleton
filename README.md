@@ -29,7 +29,7 @@ Not affiliated with or endorsed by the Sven Co-op team or Valve.
 - **Performance**: no duplicate GL rendering or GL state forwarding, two
   frames in flight, batched texture uploads, vertex transform and clipping on
   the GPU, indexed drawing, cached draw state, keyed pipeline cache,
-  SSE2/`-O3` build, optional render thread.
+  SSE2/`-O3` build, render thread.
 - **Window resize** (swapchain rebuild), `MAILBOX` presentation when available.
 - **Freecam**: press **I** to fly the camera (see *Controls*).
 - Options → Video → Renderer reads **"Vulkan"** during Vulkan sessions.
@@ -78,7 +78,9 @@ stock OpenGL renderer.
 | `SVEN_DIR` | game folder, if not found automatically |
 | `VKSKELETON_PRESENT_MODE` | `mailbox`, `immediate` or `fifo` (default: best available, `mailbox` preferred) |
 | `VKSKELETON_GL_PASSTHROUGH=1` | also send draws to OpenGL (slower; for debugging) |
-| `VKSKELETON_RENDER_THREAD=1` | **experimental**: record/submit/present Vulkan frames on a separate thread |
+| `VKSKELETON_STUDIO=0` | draw all models through the engine (disables the model fast path) |
+| `VKSKELETON_GPU_SKIN=0` | skin and light fast-path models on the CPU instead of the GPU |
+| `VKSKELETON_RENDER_THREAD=0` | record/submit/present Vulkan frames on the game thread instead of a separate render thread (on by default) |
 | `VKSKELETON_DEBUG=1` | extra one-shot logging of GL state events |
 
 Logs: `/tmp/vkplay.log.<pid>` (renderer) and `/tmp/vk-play-stdout.log` (game).
@@ -103,9 +105,9 @@ gets in the way).
 - Not emulated: fog, rendering into framebuffer objects, display lists, mipmaps,
   full `GL_COMBINE` semantics, and GL state combinations the engine was not seen
   to use.
-- Only OpenGL calls made by the engine and client are visible to the renderer;
-  deeper improvements (static world buffers, GPU skinning) would need engine
-  hooks.
+- Models are skinned and lit on the GPU when they pass the fast-path checks;
+  chrome, additive or masked textures, render effects and models with separate
+  texture files still go through the engine.
 
 ## How it works / development notes
 

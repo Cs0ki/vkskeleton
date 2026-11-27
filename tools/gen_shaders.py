@@ -404,6 +404,231 @@ def fragment_module():
     return m.words
 
 
+
+OP_TYPE_INT_ = OP_TYPE_INT
+OP_CONVERT_F_TO_S = 110
+OP_IADD = 128
+OP_FADD = 129
+OP_FSUB = 131
+OP_IMUL = 132
+OP_FDIV = 136
+OP_SHIFT_RIGHT_ARITHMETIC = 195
+OP_BITWISE_AND = 199
+OP_VECTOR_EXTRACT_DYNAMIC = 77
+OP_SELECT = 169
+DEC_ARRAY_STRIDE = 6
+SC_UNIFORM = 2
+
+SKIN_BONE_BASE = 4      # vec4 index of bone 0 in the per-draw block
+SKIN_DRAW_VEC4 = 4 + 128 * 4
+LIGHT_SLOTS = 1025      # must match vkskeleton.c
+FULLBRIGHT_SLOT = LIGHT_SLOTS - 1
+
+
+def skin_vertex_module():
+    """GoldSrc studio model skinning + lighting on the GPU.
+
+    Same outputs as vertex_module (the fragment shader is shared).  Per
+    vertex: model-space position, uv, model-space normal, and
+    (bone, normal bone, flags) with flags 0 smooth / 1 flatshade /
+    2 fullbright.  Per draw (set 2, binding 0, dynamic UBO, vec4 d[]):
+      d[0] = ambient, shadelight, lambert      d[1] = light colour rgb, alpha
+      d[2] = alpha_ref, alpha_func             d[4+4i..] = bone i rows 0-2
+      (3x4 bone->world) and row 3 = light vector in bone i's space.
+    Binding 1: the engine's light value per (int)(illum*4) slot, packed
+    4 per vec4.  Equivalent C: studio_draw_fast().
+    """
+    ids = Ids(1)
+    T = {}
+    for n in ("void flt i32 u32 boolean vec2 vec3 vec4 mat4 fn pc_struct ptr_pc "
+              "ptr_pc_mat ptr_pc_vec4 ptr_in3 ptr_in2 ptr_in4 ptr_out2 ptr_out4 "
+              "arr_f1 ptr_out_arr ptr_out_f arr_d arr_l blk_d blk_l ptr_blk_d "
+              "ptr_blk_l ptr_u_vec4").split():
+        T[n] = ids.take()
+    C = {}
+    def cf(v):
+        key = ("f", v)
+        if key not in C:
+            C[key] = ids.take()
+        return C[key]
+    def ci(v):
+        key = ("i", v)
+        if key not in C:
+            C[key] = ids.take()
+        return C[key]
+    def cu(v):
+        key = ("u", v)
+        if key not in C:
+            C[key] = ids.take()
+        return C[key]
+    for v in (0.0, 1.0, 0.8, 255.0, 4.0, 2.0):
+        cf(v)
+    for v in (0, 1, 2, 3, 4, SKIN_BONE_BASE, SKIN_BONE_BASE + 3, FULLBRIGHT_SLOT):
+        ci(v)
+    for v in (1, SKIN_DRAW_VEC4, (LIGHT_SLOTS + 3) // 4):
+        cu(v)
+    V = {}
+    for n in ("in_pos in_uv in_nrm in_ex v_uv v_color v_params v_uv2 gl_pos "
+              "clip_dist pc ubo_d ubo_l fn_main label").split():
+        V[n] = ids.take()
+
+    body = []
+    def op(opcode, rtype, *args):
+        r = ids.take()
+        body.append((opcode, rtype, r) + args)
+        return r
+    def st(ptr, val):
+        body.append((OP_STORE, ptr, val))
+
+    f, i32, v4 = T["flt"], T["i32"], T["vec4"]
+    def ld_d(idx):           # u.d[idx]
+        ptr = op(OP_ACCESS_CHAIN, T["ptr_u_vec4"], V["ubo_d"], ci(0), idx)
+        return op(OP_LOAD, v4, ptr)
+    def ex(vec, k, t=f):
+        return op(OP_COMPOSITE_EXTRACT, t, vec, k)
+    def sel(cond, a, b, t=f):
+        return op(OP_SELECT, t, cond, a, b)
+
+    pos = op(OP_LOAD, T["vec3"], V["in_pos"])
+    p4 = op(OP_COMPOSITE_CONSTRUCT, v4, ex(pos, 0), ex(pos, 1), ex(pos, 2), cf(1.0))
+    exv = op(OP_LOAD, v4, V["in_ex"])
+    bone = op(OP_CONVERT_F_TO_S, i32, ex(exv, 0))
+    b4 = op(OP_IMUL, i32, bone, ci(4))
+    r0i = op(OP_IADD, i32, b4, ci(SKIN_BONE_BASE))
+    r1i = op(OP_IADD, i32, r0i, ci(1))
+    r2i = op(OP_IADD, i32, r0i, ci(2))
+    wx = op(OP_DOT, f, ld_d(r0i), p4)
+    wy = op(OP_DOT, f, ld_d(r1i), p4)
+    wz = op(OP_DOT, f, ld_d(r2i), p4)
+    w4 = op(OP_COMPOSITE_CONSTRUCT, v4, wx, wy, wz, cf(1.0))
+    mptr = op(OP_ACCESS_CHAIN, T["ptr_pc_mat"], V["pc"], ci(0))
+    mvp = op(OP_LOAD, T["mat4"], mptr)
+    st(V["gl_pos"], op(OP_MATRIX_TIMES_VECTOR, v4, mvp, w4))
+    cptr = op(OP_ACCESS_CHAIN, T["ptr_pc_vec4"], V["pc"], ci(1))
+    cplane = op(OP_LOAD, v4, cptr)
+    dptr = op(OP_ACCESS_CHAIN, T["ptr_out_f"], V["clip_dist"], ci(0))
+    st(dptr, op(OP_DOT, f, cplane, w4))
+
+    # lighting (GoldSrc StudioLighting)
+    nbone = op(OP_CONVERT_F_TO_S, i32, ex(exv, 1))
+    nb4 = op(OP_IMUL, i32, nbone, ci(4))
+    lvi = op(OP_IADD, i32, nb4, ci(SKIN_BONE_BASE + 3))
+    lvec = ld_d(lvi)
+    nrm = op(OP_LOAD, T["vec3"], V["in_nrm"])
+    n4 = op(OP_COMPOSITE_CONSTRUCT, v4, ex(nrm, 0), ex(nrm, 1), ex(nrm, 2), cf(0.0))
+    h0 = ld_d(ci(0))
+    amb, shade, lam = ex(h0, 0), ex(h0, 1), ex(h0, 2)
+    lc0 = op(OP_DOT, f, n4, lvec)
+    lc1 = sel(op(OP_FORD_GREATER_THAN, T["boolean"], lc0, cf(1.0)), cf(1.0), lc0)
+    lam1 = op(OP_FSUB, f, lam, cf(1.0))
+    lc2 = op(OP_FDIV, f, op(OP_FADD, f, lc1, lam1), lam)
+    lcp = sel(op(OP_FORD_GREATER_THAN, T["boolean"], lc2, cf(0.0)), lc2, cf(0.0))
+    base = op(OP_FADD, f, amb, shade)
+    smooth = op(OP_FSUB, f, base, op(OP_FMUL, f, shade, lcp))
+    flat = op(OP_FADD, f, amb, op(OP_FMUL, f, shade, cf(0.8)))
+    flags = ex(exv, 2)
+    il0 = sel(op(OP_FORD_EQUAL, T["boolean"], flags, cf(1.0)), flat, smooth)
+    il1 = sel(op(OP_FORD_LESS_THAN, T["boolean"], il0, cf(0.0)), cf(0.0), il0)
+    il2 = sel(op(OP_FORD_GREATER_THAN, T["boolean"], il1, cf(255.0)), cf(255.0), il1)
+    slot0 = op(OP_CONVERT_F_TO_S, i32, op(OP_FMUL, f, il2, cf(4.0)))
+    slot = sel(op(OP_FORD_EQUAL, T["boolean"], flags, cf(2.0)), ci(FULLBRIGHT_SLOT),
+               slot0, i32)
+    li = op(OP_SHIFT_RIGHT_ARITHMETIC, i32, slot, ci(2))
+    lk = op(OP_BITWISE_AND, i32, slot, ci(3))
+    lptr = op(OP_ACCESS_CHAIN, T["ptr_u_vec4"], V["ubo_l"], ci(0), li)
+    lv = op(OP_VECTOR_EXTRACT_DYNAMIC, f, op(OP_LOAD, v4, lptr), lk)
+    h1 = ld_d(ci(1))
+    col = op(OP_COMPOSITE_CONSTRUCT, v4, op(OP_FMUL, f, ex(h1, 0), lv),
+             op(OP_FMUL, f, ex(h1, 1), lv), op(OP_FMUL, f, ex(h1, 2), lv), ex(h1, 3))
+    st(V["v_color"], col)
+    h2 = ld_d(ci(2))
+    st(V["v_params"], op(OP_COMPOSITE_CONSTRUCT, T["vec2"], ex(h2, 0), ex(h2, 1)))
+    st(V["v_uv"], op(OP_LOAD, T["vec2"], V["in_uv"]))
+    st(V["v_uv2"], op(OP_COMPOSITE_CONSTRUCT, T["vec2"], cf(0.0), cf(0.0)))
+
+    m = Module(ids.next)
+    m.inst(OP_CAPABILITY, 1)
+    m.inst(OP_CAPABILITY, 32)                    # ClipDistance
+    m.inst(OP_MEMORY_MODEL, 0, SC_GLSL450)
+    m.inst(OP_ENTRY_POINT, EXEC_VERTEX, V["fn_main"], *string_words("main"),
+           V["in_pos"], V["in_uv"], V["in_nrm"], V["in_ex"], V["v_uv"],
+           V["v_color"], V["v_params"], V["v_uv2"], V["gl_pos"], V["clip_dist"])
+    for n, loc in (("in_pos", 0), ("in_uv", 1), ("in_nrm", 2), ("in_ex", 3),
+                   ("v_uv", 0), ("v_color", 1), ("v_params", 2), ("v_uv2", 3)):
+        m.inst(OP_DECORATE, V[n], DEC_LOCATION, loc)
+    m.inst(OP_DECORATE, V["gl_pos"], DEC_BUILTIN, BUILTIN_POSITION)
+    m.inst(OP_DECORATE, V["clip_dist"], DEC_BUILTIN, BUILTIN_CLIP_DISTANCE)
+    m.inst(OP_DECORATE, T["pc_struct"], DEC_BLOCK)
+    m.inst(OP_MEMBER_DECORATE, T["pc_struct"], 0, DEC_COL_MAJOR)
+    m.inst(OP_MEMBER_DECORATE, T["pc_struct"], 0, DEC_OFFSET, 0)
+    m.inst(OP_MEMBER_DECORATE, T["pc_struct"], 0, DEC_MATRIX_STRIDE, 16)
+    m.inst(OP_MEMBER_DECORATE, T["pc_struct"], 1, DEC_OFFSET, 64)
+    for arr, blk, var, binding in (("arr_d", "blk_d", "ubo_d", 0),
+                                   ("arr_l", "blk_l", "ubo_l", 1)):
+        m.inst(OP_DECORATE, T[arr], DEC_ARRAY_STRIDE, 16)
+        m.inst(OP_DECORATE, T[blk], DEC_BLOCK)
+        m.inst(OP_MEMBER_DECORATE, T[blk], 0, DEC_OFFSET, 0)
+        m.inst(OP_DECORATE, V[var], DEC_DESCRIPTOR_SET, 2)
+        m.inst(OP_DECORATE, V[var], DEC_BINDING, binding)
+
+    m.inst(OP_TYPE_VOID, T["void"])
+    m.inst(OP_TYPE_BOOL, T["boolean"])
+    m.inst(OP_TYPE_FLOAT, T["flt"], 32)
+    m.inst(OP_TYPE_INT, T["i32"], 32, 1)
+    m.inst(OP_TYPE_INT, T["u32"], 32, 0)
+    m.inst(OP_TYPE_VECTOR, T["vec2"], T["flt"], 2)
+    m.inst(OP_TYPE_VECTOR, T["vec3"], T["flt"], 3)
+    m.inst(OP_TYPE_VECTOR, T["vec4"], T["flt"], 4)
+    m.inst(OP_TYPE_MATRIX, T["mat4"], T["vec4"], 4)
+    m.inst(OP_TYPE_FUNCTION, T["fn"], T["void"])
+    for (kind, v), cid in C.items():
+        if kind == "f":
+            m.inst(OP_CONSTANT, T["flt"], cid, fbits(v))
+        elif kind == "i":
+            m.inst(OP_CONSTANT, T["i32"], cid, v & 0xFFFFFFFF)
+        else:
+            m.inst(OP_CONSTANT, T["u32"], cid, v)
+    m.inst(OP_TYPE_STRUCT, T["pc_struct"], T["mat4"], T["vec4"])
+    m.inst(OP_TYPE_POINTER, T["ptr_pc"], SC_PUSH_CONSTANT, T["pc_struct"])
+    m.inst(OP_TYPE_POINTER, T["ptr_pc_mat"], SC_PUSH_CONSTANT, T["mat4"])
+    m.inst(OP_TYPE_POINTER, T["ptr_pc_vec4"], SC_PUSH_CONSTANT, T["vec4"])
+    m.inst(OP_TYPE_POINTER, T["ptr_in3"], SC_INPUT, T["vec3"])
+    m.inst(OP_TYPE_POINTER, T["ptr_in2"], SC_INPUT, T["vec2"])
+    m.inst(OP_TYPE_POINTER, T["ptr_in4"], SC_INPUT, T["vec4"])
+    m.inst(OP_TYPE_POINTER, T["ptr_out2"], SC_OUTPUT, T["vec2"])
+    m.inst(OP_TYPE_POINTER, T["ptr_out4"], SC_OUTPUT, T["vec4"])
+    m.inst(OP_TYPE_ARRAY, T["arr_f1"], T["flt"], cu(1))
+    m.inst(OP_TYPE_POINTER, T["ptr_out_arr"], SC_OUTPUT, T["arr_f1"])
+    m.inst(OP_TYPE_POINTER, T["ptr_out_f"], SC_OUTPUT, T["flt"])
+    m.inst(OP_TYPE_ARRAY, T["arr_d"], T["vec4"], cu(SKIN_DRAW_VEC4))
+    m.inst(OP_TYPE_ARRAY, T["arr_l"], T["vec4"], cu((LIGHT_SLOTS + 3) // 4))
+    m.inst(OP_TYPE_STRUCT, T["blk_d"], T["arr_d"])
+    m.inst(OP_TYPE_STRUCT, T["blk_l"], T["arr_l"])
+    m.inst(OP_TYPE_POINTER, T["ptr_blk_d"], SC_UNIFORM, T["blk_d"])
+    m.inst(OP_TYPE_POINTER, T["ptr_blk_l"], SC_UNIFORM, T["blk_l"])
+    m.inst(OP_TYPE_POINTER, T["ptr_u_vec4"], SC_UNIFORM, T["vec4"])
+
+    for n, ptr, sc in (("in_pos", "ptr_in3", SC_INPUT), ("in_uv", "ptr_in2", SC_INPUT),
+                       ("in_nrm", "ptr_in3", SC_INPUT), ("in_ex", "ptr_in4", SC_INPUT),
+                       ("v_uv", "ptr_out2", SC_OUTPUT), ("v_color", "ptr_out4", SC_OUTPUT),
+                       ("v_params", "ptr_out2", SC_OUTPUT), ("v_uv2", "ptr_out2", SC_OUTPUT),
+                       ("gl_pos", "ptr_out4", SC_OUTPUT),
+                       ("clip_dist", "ptr_out_arr", SC_OUTPUT),
+                       ("pc", "ptr_pc", SC_PUSH_CONSTANT),
+                       ("ubo_d", "ptr_blk_d", SC_UNIFORM),
+                       ("ubo_l", "ptr_blk_l", SC_UNIFORM)):
+        m.inst(OP_VARIABLE, T[ptr], V[n], sc)
+
+    m.inst(OP_FUNCTION, T["void"], V["fn_main"], 0, T["fn"])
+    m.inst(OP_LABEL, V["label"])
+    for ins in body:
+        m.inst(*ins)
+    m.inst(OP_RETURN)
+    m.inst(OP_FUNCTION_END)
+    m.words[3] = ids.next
+    return m.words
+
+
 def emit_array(name, words):
     lines = [f"static const uint32_t {name}[] = {{"]
     for i in range(0, len(words), 8):
@@ -416,6 +641,7 @@ def emit_array(name, words):
 def main():
     vert = vertex_module()
     frag = fragment_module()
+    skin = skin_vertex_module()
     # usage: gen_shaders.py [output header]   (default: ../src/shaders_spirv.h)
     out = (Path(sys.argv[1]) if len(sys.argv) > 1 else
            Path(__file__).resolve().parent.parent / "src" / "shaders_spirv.h")
@@ -427,8 +653,11 @@ def main():
 
 {emit_array('vk_fragment_spirv', frag)}
 
+{emit_array('vk_skin_vertex_spirv', skin)}
+
 #define VK_VERTEX_SPIRV_BYTES  (sizeof(vk_vertex_spirv))
 #define VK_FRAGMENT_SPIRV_BYTES (sizeof(vk_fragment_spirv))
+#define VK_SKIN_VERTEX_SPIRV_BYTES (sizeof(vk_skin_vertex_spirv))
 """
     out.write_text(text)
     print(f"wrote: {out} ({len(vert)} vertex words, {len(frag)} fragment words)")

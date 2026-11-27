@@ -7,6 +7,8 @@
 #   SVEN_DIR                 game folder, if not in a standard Steam location
 #   VKSKELETON_PRESENT_MODE  mailbox | immediate | fifo  (default: best available)
 #   VKSKELETON_DEBUG=1       extra one-shot logging
+#   VKSKELETON_RENDER_THREAD, VKSKELETON_STUDIO, VKSKELETON_GPU_SKIN
+#                            0 turns that feature off (see README)
 #
 # While the game runs, svencoop.sh is hooked to preload the renderer, and the
 # Options -> Video "Renderer" entry is relabelled "Vulkan".  Both are undone
@@ -118,12 +120,16 @@ if re.fullmatch(r"mailbox|immediate|fifo", mode):
     hook = f"export VKSKELETON_PRESENT_MODE={mode}\n" + hook
 if os.environ.get("VKSKELETON_DEBUG", "") == "1":
     hook = "export VKSKELETON_DEBUG=1\n" + hook
+for var in ("VKSKELETON_RENDER_THREAD", "VKSKELETON_STUDIO", "VKSKELETON_GPU_SKIN"):
+    if os.environ.get(var, "") in ("0", "1"):
+        hook = f"export {var}={os.environ[var]}\n" + hook
 anchor = "STATUS=42\nwhile"
 launch = '${GAMEROOT}/${GAMEEXE}" ${GAMEPARAMS}\n'
 if anchor not in text or launch not in text:
     sys.exit("svencoop.sh layout not recognised; not hooking it")
 text = text.replace(anchor, hook + anchor, 1)
-text = text.replace(launch, launch[:-1] + f" > {out} 2>&1\n", 1)
+# append: the engine restarts itself on video changes (exit 42 + loop)
+text = text.replace(launch, launch[:-1] + f" >> {out} 2>&1\n", 1)
 launcher.write_text(text)
 PY
 [[ $? -eq 0 ]] || exit 1

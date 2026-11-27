@@ -501,3 +501,53 @@ From the profile after the GPU-transform work (renderer ≈22% of the game threa
 5. **Build:** `-O3` (PIC kept: `-fno-pic` would add text relocations).
 
 All five built; not yet run in-game.
+
+### Crash on resolution / fullscreen change
+
+Reproduced with diagnostics (`XDestroyWindow` + swapchain-rebuild logging, launcher appending game output). Sven Co-op applies video changes **inside the same process**: it destroys the game window, creates a new one (the main one even got the same XID back), and **unloads and reloads `client.so`** (the studio interface was handed over a second time). The core dump's crashing frame was at an address in no mapped module.
+
+Cause: the client hooks (`V_CalcRefdef`, `CL_CreateMove`, `HUD_GetStudioModelInterface`) stored the real function pointer only on the first `dlsym` (`if (!real) real = result`), so after the reload they called into the unloaded `client.so`. Fixes:
+
+- Client function pointers are refreshed on every lookup.
+- `XDestroyWindow` on the presenting window (`vulkan_window_lost()`): wait for the render thread, device idle, destroy swapchain resources, swapchain and surface, mark `ready = 0`; GL draws take over meanwhile (state is resynced by `gl_sync()`).
+- When a game-sized window (≥ 64×64) is mapped while the surface is lost (`vulkan_window_new()`): create an Xlib surface and swapchain on it and resume Vulkan; a zero-size window defers the swapchain to `begin_frame()`.
+- `SDL_GL_SwapWindow` now drops a frame's Vulkan data whenever Vulkan is not ready, so nothing accumulates while the window is being replaced.
+
+Built; not yet confirmed in-game.
+
+Also seen: a separate SIGSEGV on quit inside `steamclient.so` (Steam's thread calling into an already-unloaded module), a known GoldSrc/Steam shutdown issue, not caused by the renderer.
+
+
+### Model fast path (own StudioDrawPoints)
+
+Stage 1 (pass-through hook of `HUD_GetStudioModelInterface`, table layout from the Sven Co-op 5.26 SDK's `common/r_studioint.h`: `StudioDrawPoints` is slot 25, `StudioSetupModel` 20, `StudioSetupLighting` 24, `StudioSetHeader` 35) was confirmed in-game: version 1, correct `studiohdr_t` reads, up to 62 model draws per frame, no `STUDIO_NF_UV_COORDS` textures on the tested maps.
+
+Stage 2 replaces `StudioDrawPoints` on the CPU: vertices skinned with `StudioGetBoneTransform()` matrices; normals lit like GoldSrc (ambient + shade, light vector rotated into bone space with `StudioGetLightTransform()`, hemispherical `lambert` cvar shaping, flat-shade ×0.8, clamp 0..255); texture per mesh from the skin family (`curstate.skin`); strips/fans fed directly to `append_geometry()` instead of per-vertex GL calls.
+
+Correctness guard: each submodel's first 3 draws are drawn by the engine while `push_im_vertex()` records its output, and our version is computed in parallel and compared vertex by vertex (position ±0.05, UV ±1e-3, same texture slot, alpha 1, colour = learned light value × light colour ±0.01). The engine's light gamma curve is learned from those draws into `light_table[(int)(illum*4)]`; a conflicting value disables the fast path globally (logged). Only submodels that pass switch over (`studio fast path: <model>`); others stay on the engine (`studio engine path: ... ours=N engine=M`). Always on the engine path: force-face flags (chrome/glow shell), entities with non-normal rendermode or any renderfx, active blending, textures in a separate T.mdl, CHROME/ADDITIVE/MASKED/UV_COORDS textures, more than 2048 verts/normals or 128 bones, light values not learned yet. Not reproduced: dynamic elights on models (a validating draw lit by one fails and stays on the engine path). `VKSKELETON_STUDIO=0` disables it. Built; not yet run in-game.
+
+## GPU skinning (studio models)
+
+- The submodel pointer left by the client's `StudioSetupModel` is not an
+  `mstudiomodel_t` in 5.26; the submodel is computed like the engine does:
+  `(curstate.body / base) % nummodels` within the bodypart.
+- CPU fast path alone measured ~33 µs per draw vs ~47 µs through the engine
+  (per-vertex emission dominates).
+- Validated submodels now go to `studio_draw_gpu`: each (submodel, skin) is
+  expanded once into a static vertex/index buffer (model-space position,
+  normal, uv, bone, normal bone, flags); per draw only the bone 3x4 rows,
+  the light vector per bone and the lighting scalars are written to a
+  dynamic UBO (set 2, binding 0). The engine's light curve (learned per
+  `(int)(illum*4)` slot during validation, gaps interpolated) is binding 1.
+- Pipelines with `PKEY_SKIN` use the skinned vertex shader
+  (`skin_vertex_module` in tools/gen_shaders.py); the fragment shader is
+  shared. `VKSKELETON_GPU_SKIN=0` falls back to CPU skinning.
+- A light-slot mismatch during validation now only keeps that submodel on the
+  engine path (it used to disable the fast path for the session).
+
+## Render thread on by default
+
+The render thread (see "Optional render thread" above) is now on by default;
+`VKSKELETON_RENDER_THREAD=0` restores the synchronous path. `play_vulkan.sh`
+passes `VKSKELETON_RENDER_THREAD`, `VKSKELETON_STUDIO` and
+`VKSKELETON_GPU_SKIN` (0/1) through to the game.

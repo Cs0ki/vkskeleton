@@ -26,6 +26,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <pthread.h>
+#include <time.h>
 
 #include "shaders_spirv.h"
 #include "vkx.h"
@@ -196,6 +197,33 @@ static VkDeviceMemory index_memory;
 static void *index_map;
 static VkDescriptorSetLayout descriptor_layout;
 static VkDescriptorPool descriptor_pool;
+/* GPU skinning of studio models (studio_draw_gpu): each submodel's vertices
+ * and triangles are stored once; per draw only the bones and lighting go to
+ * a per-frame-slot uniform ring.  VKSKELETON_GPU_SKIN=0 disables. */
+typedef struct {
+    float x, y, z, u, v, nx, ny, nz;  /* model space */
+    float bone, nbone, flags, pad;    /* flags: 0 smooth 1 flatshade 2 fullbright */
+} skin_vertex_t;
+#define SKIN_MAX_VERTICES (1u << 20)              /* 48 MiB */
+#define SKIN_MAX_INDICES (3u << 20)               /* 12 MiB */
+#define SKIN_UBO_SLOT_BYTES (4u << 20)
+#define SKIN_DRAW_BYTES ((4 + 128 * 4) * 16)      /* gen_shaders.py SKIN_DRAW_VEC4 */
+#define SKIN_LUT_BYTES (((1025 + 3) / 4) * 16)    /* LIGHT_SLOTS, 4 per vec4 */
+#define PKEY_SKIN (1u << 23)                      /* pipeline: skinned vertex shader */
+static VkBuffer skin_vb, skin_ib, skin_ubo;
+static VkDeviceMemory skin_vb_mem, skin_ib_mem, skin_ubo_mem;
+static void *skin_vb_map, *skin_ib_map, *skin_ubo_map;
+static VkShaderModule skin_vert_module;
+static VkDescriptorSetLayout skin_set_layout;
+static VkDescriptorPool skin_pool;
+static VkDescriptorSet skin_set;
+static uint32_t skin_ubo_align = 256;
+static int skin_ready;
+static uint32_t skin_ubo_used;   /* bytes used in this frame slot's region */
+static int skin_lut_done;        /* this slot's light table written */
+static int skin_reset_pending;   /* cache full: reset at next frame start */
+static unsigned studio_gpu_calls; /* model draws skinned on the GPU */
+static void skin_cache_reset(void);
 static VkSampler texture_sampler;
 static VkSampler sampler_linear_repeat;
 static VkSampler sampler_linear_clamp;
@@ -235,6 +263,11 @@ static int swapchain_dead;
 static int swapchain_needs_rebuild;  /* resize: OUT_OF_DATE / SUBOPTIMAL */
 static Display *vk_dpy;
 static Window vk_win;
+static int vk_surface_lost; /* window destroyed; waiting for its successor */
+static int create_swapchain(void);
+static int create_swap_resources(void);
+static void destroy_swap_resources(void);
+static void vulkan_window_new(Display *dpy, Window win);
 static VkSurfaceFormatKHR vk_surface_format;
 static int enabled;
 static int geometry_enabled;
@@ -334,6 +367,7 @@ typedef struct {
     uint32_t pkey;          /* pipeline state key, see pipeline_key() */
     uint32_t sref;          /* stencil reference (dynamic state) */
     float bias_s, bias_c;   /* depth bias slope/constant (dynamic state) */
+    uint32_t skin_ubo;      /* PKEY_SKIN: this draw's offset in skin_ubo */
 } frame_batch_t;
 #define MAX_FRAME_MATS 65536
 /* Per draw: [0-15] final mvp, [16-19] clip plane (both pushed to the
@@ -448,7 +482,7 @@ static float rec_clear_color[4];
 static float last_proj_tan[4];   /* game side: last perspective projection */
 static float last_persp_proj[16]; /* ... and the matrix (0 until seen) */
 static float rec_proj_tan[4];    /* snapshot for vkx_frame_end */
-/* Opt-in render thread (VKSKELETON_RENDER_THREAD=1). */
+/* Render thread (on by default; VKSKELETON_RENDER_THREAD=0 disables). */
 static int render_thread_enabled;
 static pthread_t render_thread;
 static int render_thread_started;
@@ -471,6 +505,30 @@ static unsigned state_serial = 1;     /* texture/blend/depth/stencil/... */
  * (it renders nothing then).  gl_out_of_sync records that; gl_sync() pushes
  * all tracked state into GL before anything really draws through it. */
 static int gl_out_of_sync;
+static unsigned studio_draw_calls; /* StudioDrawPoints calls this frame */
+/* Model fast-path validation: while on, push_im_vertex() records every
+ * vertex the engine's own StudioDrawPoints emits (x y z u v r g b a slot). */
+#define STUDIO_CAP_MAX 32768
+static int studio_capture_on;
+static unsigned studio_fast_calls; /* draws taken by the fast path */
+/* why draws were not eligible (counts per log period) */
+enum { SF_NOSUB, SF_GLPATH, SF_BLEND, SF_INPUT, SF_FACEFLAGS, SF_ENTITY, SF_RENDER, SF_TEXHDR,
+       SF_SIZES, SF_TEXFLAGS, SF_BONES, SF_TRICMD, SF_LIGHT, SF_REASONS };
+static const char *sf_names[SF_REASONS] = {
+    "nosubmodel", "glpath", "blend", "input", "faceflags", "entity", "render", "texhdr", "sizes",
+    "texflags", "bones", "tricmd", "unlearned"};
+static unsigned sf_count[SF_REASONS];
+#define SF_FAIL(r) do { sf_count[r]++; return -1; } while (0)
+static unsigned studio_cap_n;
+static float studio_cap[STUDIO_CAP_MAX][10];
+static double studio_ns;           /* time inside StudioDrawPoints, this period */
+
+static double now_ns(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec * 1e9 + ts.tv_nsec;
+}
 static GLboolean color_mask_rgba[4] = {1, 1, 1, 1};
 static GLuint st_mask = 0xff;
 static int gl_skip_state(void);
@@ -524,6 +582,7 @@ PFN(CreateInstance);
 PFN(EnumeratePhysicalDevices);
 PFN(GetPhysicalDeviceQueueFamilyProperties);
 PFN(GetPhysicalDeviceMemoryProperties);
+PFN(GetPhysicalDeviceProperties);
 PFN(GetPhysicalDeviceFeatures);
 PFN(GetPhysicalDeviceSurfaceSupportKHR);
 PFN(GetPhysicalDeviceSurfaceCapabilitiesKHR);
@@ -582,6 +641,7 @@ PFN(QueuePresentKHR);
 PFN(QueueWaitIdle);
 PFN(DestroyFramebuffer);
 PFN(DestroySwapchainKHR);
+PFN(DestroySurfaceKHR);
 PFN(DeviceWaitIdle);
 PFN(CmdSetViewport);
 PFN(CmdSetScissor);
@@ -892,6 +952,9 @@ static void mark_mapped(Display *dpy, Window window)
                 logf_msg("vkskeleton: X window %lu mapped\n",
                          (unsigned long)window);
             tracked[i].mapped = 1;
+            if (vk_surface_lost && tracked[i].width >= 64 &&
+                tracked[i].height >= 64)
+                vulkan_window_new(dpy, window);
             return;
         }
     }
@@ -967,6 +1030,72 @@ Window XCreateSimpleWindow(Display *dpy, Window parent, int x, int y,
                  : None;
     track_window(dpy, result, parent, width, height);
     return result;
+}
+
+typedef int (*fn_x_destroy_window)(Display *, Window);
+
+/* Video restarts (resolution, fullscreen) destroy the game window and create
+ * a new one.  Release the surface while the old window still exists; GL
+ * draws take over until the new window is mapped (mark_mapped). */
+static void vulkan_window_lost(void)
+{
+    if (!device || !surface)
+        return;
+    if (render_thread_enabled)
+        render_thread_wait_idle();
+    pthread_mutex_lock(&queue_mtx);
+    p_vkDeviceWaitIdle(device);
+    pthread_mutex_unlock(&queue_mtx);
+    completed_serial = frame_serial;
+    destroy_swap_resources();
+    if (swapchain)
+        p_vkDestroySwapchainKHR(device, swapchain, NULL);
+    swapchain = VK_NULL_HANDLE;
+    p_vkDestroySurfaceKHR(instance, surface, NULL);
+    surface = VK_NULL_HANDLE;
+    frame_active = 0;
+    ready = 0;
+    vk_surface_lost = 1;
+}
+
+static void vulkan_window_new(Display *dpy, Window win)
+{
+    VkXlibSurfaceCreateInfoKHR sci = {0};
+    int rc;
+
+    sci.sType = VK_STRUCTURE_TYPE_XLIB_SURFACE_CREATE_INFO_KHR;
+    sci.dpy = dpy;
+    sci.window = win;
+    if (p_vkCreateXlibSurfaceKHR(instance, &sci, NULL, &surface) != VK_SUCCESS) {
+        logmsg("vkskeleton: new window: CreateXlibSurfaceKHR failed\n");
+        return;
+    }
+    vk_dpy = dpy;
+    vk_win = win;
+    vk_surface_lost = 0;
+    rc = create_swapchain();
+    if (rc > 0 && create_swap_resources())
+        swapchain_needs_rebuild = 0;
+    else
+        swapchain_needs_rebuild = 1; /* begin_frame retries */
+    ready = 1;
+    logf_msg("vkskeleton: Vulkan moved to new window %lu\n", (unsigned long)win);
+}
+static fn_x_destroy_window real_x_destroy_window;
+
+/* Diagnostic: video-mode changes may destroy the window the swapchain is
+ * bound to. */
+int XDestroyWindow(Display *dpy, Window window)
+{
+    if (!real_x_destroy_window)
+        real_x_destroy_window =
+            (fn_x_destroy_window)next_symbol("XDestroyWindow");
+    if (window && window == vk_win) {
+        logf_msg("vkskeleton: XDestroyWindow on the Vulkan window %lu\n",
+                 (unsigned long)window);
+        vulkan_window_lost(); /* before the window is gone */
+    }
+    return real_x_destroy_window ? real_x_destroy_window(dpy, window) : 0;
 }
 
 int XMapWindow(Display *dpy, Window window)
@@ -1565,6 +1694,122 @@ static void destroy_swap_resources(void)
     }
 }
 
+/* Host-visible buffer, preferring device-local (BAR) memory for GPU reads. */
+static int make_host_buffer(VkDeviceSize size, VkBufferUsageFlags usage,
+                            VkBuffer *buf, VkDeviceMemory *mem, void **map)
+{
+    VkBufferCreateInfo bci = {0};
+    VkMemoryRequirements req;
+    VkMemoryAllocateInfo mai = {0};
+    VkMemoryPropertyFlags hv = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                               VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+
+    bci.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+    bci.size = size;
+    bci.usage = usage;
+    bci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    if (p_vkCreateBuffer(device, &bci, NULL, buf) != VK_SUCCESS)
+        return 0;
+    p_vkGetBufferMemoryRequirements(device, *buf, &req);
+    mai.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+    mai.allocationSize = req.size;
+    mai.memoryTypeIndex =
+        find_memory_type(req, hv | VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    if (mai.memoryTypeIndex == ~0u ||
+        p_vkAllocateMemory(device, &mai, NULL, mem) != VK_SUCCESS) {
+        mai.memoryTypeIndex = find_memory_type(req, hv);
+        if (mai.memoryTypeIndex == ~0u ||
+            p_vkAllocateMemory(device, &mai, NULL, mem) != VK_SUCCESS)
+            return 0;
+    }
+    return p_vkBindBufferMemory(device, *buf, *mem, 0) == VK_SUCCESS &&
+           p_vkMapMemory(device, *mem, 0, req.size, 0, map) == VK_SUCCESS;
+}
+
+static int create_skin_resources(void)
+{
+    VkShaderModuleCreateInfo smci = {0};
+    VkDescriptorSetLayoutBinding b[2];
+    VkDescriptorSetLayoutCreateInfo dslci = {0};
+    VkDescriptorPoolSize ps = {0};
+    VkDescriptorPoolCreateInfo dpci = {0};
+    VkDescriptorSetAllocateInfo dsai = {0};
+    VkDescriptorBufferInfo bi[2];
+    VkWriteDescriptorSet w[2];
+    VkPhysicalDeviceProperties props;
+    const char *e = getenv("VKSKELETON_GPU_SKIN");
+    int k;
+
+    if (e && !strcmp(e, "0"))
+        return 0;
+    memset(&props, 0, sizeof(props));
+    p_vkGetPhysicalDeviceProperties(physdev, &props);
+    if (props.limits.maxUniformBufferRange < SKIN_DRAW_BYTES)
+        return 0;
+    if (props.limits.minUniformBufferOffsetAlignment)
+        skin_ubo_align = (uint32_t)props.limits.minUniformBufferOffsetAlignment;
+
+    smci.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
+    smci.codeSize = VK_SKIN_VERTEX_SPIRV_BYTES;
+    smci.pCode = vk_skin_vertex_spirv;
+    if (p_vkCreateShaderModule(device, &smci, NULL, &skin_vert_module) != VK_SUCCESS)
+        return 0;
+    memset(b, 0, sizeof(b));
+    for (k = 0; k < 2; k++) {
+        b[k].binding = (uint32_t)k;
+        b[k].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC;
+        b[k].descriptorCount = 1;
+        b[k].stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
+    }
+    dslci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+    dslci.bindingCount = 2;
+    dslci.pBindings = b;
+    if (p_vkCreateDescriptorSetLayout(device, &dslci, NULL, &skin_set_layout) !=
+        VK_SUCCESS)
+        return 0;
+    ps.type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC;
+    ps.descriptorCount = 2;
+    dpci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+    dpci.maxSets = 1;
+    dpci.poolSizeCount = 1;
+    dpci.pPoolSizes = &ps;
+    if (p_vkCreateDescriptorPool(device, &dpci, NULL, &skin_pool) != VK_SUCCESS)
+        return 0;
+    dsai.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+    dsai.descriptorPool = skin_pool;
+    dsai.descriptorSetCount = 1;
+    dsai.pSetLayouts = &skin_set_layout;
+    if (p_vkAllocateDescriptorSets(device, &dsai, &skin_set) != VK_SUCCESS)
+        return 0;
+    if (!make_host_buffer((VkDeviceSize)SKIN_MAX_VERTICES * sizeof(skin_vertex_t),
+                          VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, &skin_vb,
+                          &skin_vb_mem, &skin_vb_map) ||
+        !make_host_buffer((VkDeviceSize)SKIN_MAX_INDICES * sizeof(uint32_t),
+                          VK_BUFFER_USAGE_INDEX_BUFFER_BIT, &skin_ib,
+                          &skin_ib_mem, &skin_ib_map) ||
+        !make_host_buffer((VkDeviceSize)SKIN_UBO_SLOT_BYTES * FRAMES_IN_FLIGHT +
+                              SKIN_DRAW_BYTES,
+                          VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, &skin_ubo,
+                          &skin_ubo_mem, &skin_ubo_map))
+        return 0;
+    memset(bi, 0, sizeof(bi));
+    memset(w, 0, sizeof(w));
+    bi[0].buffer = bi[1].buffer = skin_ubo;
+    bi[0].range = SKIN_DRAW_BYTES;
+    bi[1].range = SKIN_LUT_BYTES;
+    for (k = 0; k < 2; k++) {
+        w[k].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        w[k].dstSet = skin_set;
+        w[k].dstBinding = (uint32_t)k;
+        w[k].descriptorCount = 1;
+        w[k].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC;
+        w[k].pBufferInfo = &bi[k];
+    }
+    p_vkUpdateDescriptorSets(device, 2, w, 0, NULL);
+    logf_msg("vkskeleton: GPU skinning ready (ubo align %u)\n", skin_ubo_align);
+    return 1;
+}
+
 static int create_graphics_resources(void)
 {
     VkAttachmentDescription color_att = {0};
@@ -1785,12 +2030,16 @@ static int create_graphics_resources(void)
         logmsg("vkskeleton: default texture ready\n");
     }
 
+    skin_ready = create_skin_resources();
+    if (!skin_ready)
+        logmsg("vkskeleton: GPU skinning off\n");
     plci.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
     {
-        static VkDescriptorSetLayout set_layouts[2];
+        static VkDescriptorSetLayout set_layouts[3];
         set_layouts[0] = descriptor_layout;
         set_layouts[1] = descriptor_layout;
-        plci.setLayoutCount = 2;
+        set_layouts[2] = skin_set_layout;
+        plci.setLayoutCount = skin_ready ? 3 : 2;
         plci.pSetLayouts = set_layouts;
         {
             /* mat4 mvp for the vertex shader (one per batch). */
@@ -2025,6 +2274,8 @@ static int recreate_swapchain(void)
 {
     int rc;
 
+    logf_msg("vkskeleton: swapchain rebuild (was %ux%u)\n", swap_extent.width,
+             swap_extent.height);
     pthread_mutex_lock(&queue_mtx);
     p_vkDeviceWaitIdle(device);
     pthread_mutex_unlock(&queue_mtx);
@@ -2032,6 +2283,7 @@ static int recreate_swapchain(void)
     destroy_swap_resources();
     rc = create_swapchain();
     if (rc <= 0) {
+        logf_msg("vkskeleton: swapchain rebuild deferred/failed (%d)\n", rc);
         swapchain_needs_rebuild = 1; /* retry next frame */
         return rc;
     }
@@ -2110,12 +2362,14 @@ static int init_vulkan(Display *dpy, Window win)
         LOAD_INSTance(EnumeratePhysicalDevices);                               \
         LOAD_INSTance(GetPhysicalDeviceQueueFamilyProperties);                 \
         LOAD_INSTance(GetPhysicalDeviceMemoryProperties);                      \
+        LOAD_INSTance(GetPhysicalDeviceProperties);                            \
         LOAD_INSTance(GetPhysicalDeviceFeatures);                              \
         LOAD_INSTance(GetPhysicalDeviceSurfaceSupportKHR);                     \
         LOAD_INSTance(GetPhysicalDeviceSurfaceCapabilitiesKHR);                \
         LOAD_INSTance(GetPhysicalDeviceSurfaceFormatsKHR);                     \
         LOAD_INSTance(GetPhysicalDeviceSurfacePresentModesKHR);                \
         LOAD_INSTance(CreateXlibSurfaceKHR);                                   \
+        LOAD_INSTance(DestroySurfaceKHR);                                      \
         LOAD_INSTance(CreateDevice);                                           \
         LOAD_INSTance(GetDeviceQueue);                                         \
     } while (0)
@@ -2593,6 +2847,17 @@ static VkPipeline create_pipeline_for_key(uint32_t k)
     visa.pVertexBindingDescriptions = &binding;
     visa.vertexAttributeDescriptionCount = 5;
     visa.pVertexAttributeDescriptions = attrs;
+    if (k & PKEY_SKIN) {
+        stages[0].module = skin_vert_module;
+        binding.stride = sizeof(skin_vertex_t);
+        attrs[0].offset = offsetof(skin_vertex_t, x);
+        attrs[1].offset = offsetof(skin_vertex_t, u);
+        attrs[2].format = VK_FORMAT_R32G32B32_SFLOAT;
+        attrs[2].offset = offsetof(skin_vertex_t, nx);
+        attrs[3].format = VK_FORMAT_R32G32B32A32_SFLOAT;
+        attrs[3].offset = offsetof(skin_vertex_t, bone);
+        visa.vertexAttributeDescriptionCount = 4;
+    }
 
     pia.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
     pia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
@@ -3212,6 +3477,7 @@ static void replay_cmds(VkCommandBuffer cb)
     {
         uint32_t last_mat = ~0u;
         uint32_t ci;
+        int skin_bound = 0; /* skin_vb/ib bound instead of the frame's */
 
         for (ci = 0; ci < rec_cmd_count; ci++) {
             const frame_cmd_t *c = &rec_cmds[ci];
@@ -3253,6 +3519,7 @@ static void replay_cmds(VkCommandBuffer cb)
                                            FRAME_INDEX_BYTES,
                                        VK_INDEX_TYPE_UINT32);
                 last_mat = ~0u;
+                skin_bound = 0;
                 continue;
             }
             {
@@ -3298,8 +3565,36 @@ static void replay_cmds(VkCommandBuffer cb)
                     p_vkCmdSetDepthBias(cb, b->bias_c, 0.0f, b->bias_s);
                 p_vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS,
                                           pipeline_layout, 0, 2, sets, 0, NULL);
+                if (b->pkey & PKEY_SKIN) {
+                    uint32_t dyn[2];
+                    if (!skin_bound) {
+                        VkDeviceSize z = 0;
+                        p_vkCmdBindVertexBuffers(cb, 0, 1, &skin_vb, &z);
+                        p_vkCmdBindIndexBuffer(cb, skin_ib, 0,
+                                               VK_INDEX_TYPE_UINT32);
+                        skin_bound = 1;
+                    }
+                    dyn[0] = b->skin_ubo;
+                    dyn[1] = rec_slot * SKIN_UBO_SLOT_BYTES; /* light table */
+                    p_vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                              pipeline_layout, 2, 1, &skin_set,
+                                              2, dyn);
+                } else if (skin_bound) {
+                    p_vkCmdBindVertexBuffers(cb, 0, 1, &vertex_buffer, &offset);
+                    p_vkCmdBindIndexBuffer(cb, index_buffer,
+                                           (VkDeviceSize)rec_slot *
+                                               FRAME_INDEX_BYTES,
+                                           VK_INDEX_TYPE_UINT32);
+                    skin_bound = 0;
+                }
                 p_vkCmdDrawIndexed(cb, b->count, 1, b->first, 0, 0);
             }
+        }
+        if (skin_bound) {
+            p_vkCmdBindVertexBuffers(cb, 0, 1, &vertex_buffer, &offset);
+            p_vkCmdBindIndexBuffer(cb, index_buffer,
+                                   (VkDeviceSize)rec_slot * FRAME_INDEX_BYTES,
+                                   VK_INDEX_TYPE_UINT32);
         }
     }
 }
@@ -3403,6 +3698,10 @@ static int frame_slot_begin(void)
     frame_cmd_count = 0;
     frame_mat_count = 0;
     frame_epoch++;
+    skin_ubo_used = 0;
+    skin_lut_done = 0;
+    if (skin_reset_pending)
+        skin_cache_reset();
     frame_slot_ready = 1;
     return 1;
 }
@@ -3527,6 +3826,8 @@ static void emit_tri(size_t ia, size_t ib, size_t ic)
     batch_add_tri(&im_vertices[ia]);
 }
 
+static int draw_matrix_ready(void);
+
 static void append_geometry(void)
 {
     size_t i;
@@ -3545,30 +3846,8 @@ static void append_geometry(void)
                   stencil_test_enabled, st_func, st_ref);
     if (!frame_slot_begin())
         return;
-    {
-        static unsigned done_xform, done_epoch;
-        if (done_xform != xform_serial || done_epoch != frame_epoch ||
-            cur_draw_mat == ~0u) {
-            mat_mul(&mat_mvp, &mat_proj, &mat_model);
-            cur_draw_mat = frame_matrix_for_draw();
-            if (mat_proj.m[11] < -0.5f && mat_proj.m[0] != 0.0f &&
-                mat_proj.m[5] != 0.0f) {
-                /* glFrustum: tangents of the left/right/down/up planes */
-                const float *m = mat_proj.m;
-                last_proj_tan[0] = (m[8] - 1.0f) / m[0];
-                last_proj_tan[1] = (m[8] + 1.0f) / m[0];
-                last_proj_tan[2] = (m[9] - 1.0f) / m[5];
-                last_proj_tan[3] = (m[9] + 1.0f) / m[5];
-                memcpy(last_persp_proj, m, sizeof(last_persp_proj));
-            }
-            done_xform = xform_serial;
-            done_epoch = frame_epoch;
-        }
-    }
-    if (cur_draw_mat == ~0u) {
-        note_frame_overflow();
+    if (!draw_matrix_ready())
         return;
-    }
     if (frame_vertex_count + im_vertex_count > FRAME_MAX_VERTICES) {
         note_frame_overflow();
         return;
@@ -3580,7 +3859,6 @@ static void append_geometry(void)
         memcpy(&frame_vertices[frame_vertex_count + i], &im_vertices[i],
                sizeof(vk_vertex_t));
     frame_vertex_count += im_vertex_count;
-
     switch (im_mode) {
     case GL_TRIANGLES:
         for (i = 0; i + 2 < im_vertex_count; i += 3)
@@ -3626,6 +3904,37 @@ static void append_geometry(void)
         }
         break;
     }
+}
+
+/* The current GL matrices as this frame's draw matrix (cur_draw_mat).
+ * Returns 0 (overflow logged) when the matrix table is full. */
+static int draw_matrix_ready(void)
+{
+    {
+        static unsigned done_xform, done_epoch;
+        if (done_xform != xform_serial || done_epoch != frame_epoch ||
+            cur_draw_mat == ~0u) {
+            mat_mul(&mat_mvp, &mat_proj, &mat_model);
+            cur_draw_mat = frame_matrix_for_draw();
+            if (mat_proj.m[11] < -0.5f && mat_proj.m[0] != 0.0f &&
+                mat_proj.m[5] != 0.0f) {
+                /* glFrustum: tangents of the left/right/down/up planes */
+                const float *m = mat_proj.m;
+                last_proj_tan[0] = (m[8] - 1.0f) / m[0];
+                last_proj_tan[1] = (m[8] + 1.0f) / m[0];
+                last_proj_tan[2] = (m[9] - 1.0f) / m[5];
+                last_proj_tan[3] = (m[9] + 1.0f) / m[5];
+                memcpy(last_persp_proj, m, sizeof(last_persp_proj));
+            }
+            done_xform = xform_serial;
+            done_epoch = frame_epoch;
+        }
+    }
+    if (cur_draw_mat == ~0u) {
+        note_frame_overflow();
+        return 0;
+    }
+    return 1;
 }
 
 /* Everything except colour/texcoords is fixed between glBegin and glEnd (GL
@@ -3712,6 +4021,12 @@ static void push_im_vertex(float x, float y, float z)
     v->depth = ds.depth;
     v->alpha_ref = ds.alpha_ref;
     v->alpha_func = ds.alpha_func;
+    if (studio_capture_on && studio_cap_n < STUDIO_CAP_MAX) {
+        float *c = studio_cap[studio_cap_n++];
+        c[0] = x; c[1] = y; c[2] = z; c[3] = cur_u; c[4] = cur_v;
+        c[5] = cur_color[0]; c[6] = cur_color[1]; c[7] = cur_color[2];
+        c[8] = cur_color[3]; c[9] = (float)tex_slot;
+    }
 }
 
 /* GoldSrc's HUD, console and text rendering use interleaved client arrays:
@@ -5279,7 +5594,44 @@ void SDL_GL_SwapWindow(void *window)
 {
     if (debug_enabled)
         dbg.frames++;
-    if (!enabled || !ready) {
+    {
+        /* every 900 frames: share of frame time spent drawing models */
+        static unsigned frames, calls;
+        static double t_start;
+        double t = now_ns();
+        if (!t_start)
+            t_start = t;
+        frames++;
+        calls += studio_draw_calls;
+        studio_draw_calls = 0;
+        if (frames == 900) {
+            double frame_ms = (t - t_start) / 1e6 / frames;
+            double model_ms = studio_ns / 1e6 / frames;
+            logf_msg("vkskeleton: studio: %.2f ms/frame in StudioDrawPoints "
+                     "(%u calls/frame, %u fast, %u on GPU) of %.2f ms/frame = %.0f%%\n",
+                     model_ms, calls / frames, studio_fast_calls / frames,
+                     studio_gpu_calls / frames,
+                     frame_ms, frame_ms > 0 ? 100.0 * model_ms / frame_ms : 0.0);
+            {
+                char buf[256];
+                size_t n = 0;
+                int r;
+                for (r = 0; r < SF_REASONS; r++)
+                    if (sf_count[r])
+                        n += (size_t)snprintf(buf + n, sizeof(buf) - n,
+                                              " %s=%u", sf_names[r], sf_count[r]);
+                if (n)
+                    logf_msg("vkskeleton: studio not eligible:%s\n", buf);
+                memset(sf_count, 0, sizeof(sf_count));
+            }
+            frames = calls = 0;
+            studio_fast_calls = 0;
+            studio_gpu_calls = 0;
+            studio_ns = 0;
+            t_start = t;
+        }
+    }
+    if (!enabled) {
         if (!real_sdl_swap_window)
             real_sdl_swap_window =
                 (fn_sdl_swap_window)next_symbol("SDL_GL_SwapWindow");
@@ -5288,7 +5640,7 @@ void SDL_GL_SwapWindow(void *window)
         return;
     }
 
-    if ((frame_has_clear || frame_vertex_count) && submit_frame())
+    if (ready && (frame_has_clear || frame_vertex_count) && submit_frame())
         return;
     /* Frame not presented by Vulkan (e.g. minimized/resizing): drop it, but
      * still execute its texture uploads. */
@@ -5506,6 +5858,794 @@ static void vk_V_CalcRefdef(void *pparams)
     memcpy(p + 12, u, sizeof(u));            /* up */
 }
 
+
+/* ---------- studio model interface (stage 1: pass-through + logging) ----
+ * The engine hands client.so its studio function table (engine_studio_api_t,
+ * layout from the reverse-engineered Sven Co-op 5.26 SDK, common/
+ * r_studioint.h) through HUD_GetStudioModelInterface, which it looks up by
+ * name.  We wrap a few entries before the client copies the table.  Indices
+ * are slots of 4-byte function pointers (i386). */
+#define STUDIO_INTERFACE_VERSION 1
+#define ESA_STUDIO_SETUP_MODEL 20
+#define ESA_STUDIO_DRAW_POINTS 25
+#define ESA_STUDIO_SET_HEADER 35
+#define ESA_NUM_ENTRIES 46
+#define STUDIO_NF_UV_COORDS 0x80000000u
+
+typedef int (*fn_hud_get_studio_iface)(int, void **, void **);
+typedef void (*fn_studio_void)(void);
+typedef void (*fn_studio_set_header)(void *);
+typedef void (*fn_studio_setup_model)(int, void **, void **);
+static fn_hud_get_studio_iface real_hud_get_studio_iface;
+static fn_studio_void real_studio_draw_points;
+static fn_studio_set_header real_studio_set_header;
+static fn_studio_setup_model real_studio_setup_model;
+static const unsigned char *studio_hdr;      /* current studiohdr_t */
+
+static void vk_StudioSetHeader(void *header)
+{
+    static const void *seen[24];
+    static int nseen;
+    int i;
+
+    studio_hdr = (const unsigned char *)header;
+    if (header && nseen < 24) {
+        for (i = 0; i < nseen && seen[i] != header; i++)
+            ;
+        if (i == nseen) {
+            /* studiohdr_t: name[64]@8, numbones@140, numtextures@180,
+             * textureindex@184, numbodyparts@204; mstudiotexture_t is 80
+             * bytes with flags@64 */
+            const unsigned char *h = studio_hdr;
+            int numbones, ntex, texidx, nbody, uv = 0, k;
+            memcpy(&numbones, h + 140, 4);
+            memcpy(&ntex, h + 180, 4);
+            memcpy(&texidx, h + 184, 4);
+            memcpy(&nbody, h + 204, 4);
+            for (k = 0; texidx > 0 && k < ntex && k < 64; k++) {
+                uint32_t fl;
+                memcpy(&fl, h + texidx + k * 80 + 64, 4);
+                if (fl & STUDIO_NF_UV_COORDS)
+                    uv++;
+            }
+            seen[nseen++] = header;
+            logf_msg("vkskeleton: studio model %.64s bones=%d bodyparts=%d "
+                     "textures=%d uvcoords=%d\n", (const char *)(h + 8),
+                     numbones, nbody, ntex, uv);
+        }
+    }
+    if (real_studio_set_header)
+        real_studio_set_header(header);
+}
+
+/* ---------- model fast path ----------
+ * Our own StudioDrawPoints: skin with the engine's bone matrices, light the
+ * normals like GoldSrc (ambient + hemispherical "lambert" shading in bone
+ * space), and feed strips/fans straight into the Vulkan batching instead of
+ * thousands of intercepted GL calls.  Safety: a submodel only switches to
+ * it after its first draws matched the engine's output vertex by vertex
+ * (positions, UVs, texture, colour); the engine's light gamma table is
+ * learned from those same draws.  Anything unusual stays on the engine path.
+ * Layouts: Sven Co-op 5.26 SDK (engine/studio.h, common/entity_state.h,
+ * common/com_model.h, common/cvardef.h), i386. */
+#define ESA_GET_CURRENT_ENTITY 6
+#define ESA_GET_CVAR 11
+#define ESA_GET_BONE_TRANSFORM 16
+#define ESA_GET_LIGHT_TRANSFORM 17
+#define ESA_STUDIO_SETUP_LIGHTING 24
+#define ESA_GET_FORCE_FACE_FLAGS 33
+#define STUDIO_NF_FLATSHADE 0x0001u
+#define STUDIO_NF_CHROME 0x0002u
+#define STUDIO_NF_FULLBRIGHT 0x0004u
+#define STUDIO_NF_ADDITIVE 0x0020u
+#define STUDIO_NF_MASKED 0x0040u
+#define STUDIO_MAX_VERTS 2048
+#define STUDIO_MAX_BONES 128
+#define STUDIO_VALIDATE_DRAWS 3
+#define LIGHT_SLOTS 1025 /* (int)(illum * 4) in 0..1020, + fullbright */
+
+typedef struct { unsigned char r, g, b; } sc_color24;
+typedef struct { /* entity_state_t */
+    int entityType, number; float msg_time; int messagenum;
+    float origin[3], angles[3]; int modelindex, sequence; float frame;
+    int colormap; short skin, solid; int effects; float scale;
+    unsigned char eflags; int rendermode, renderamt; sc_color24 rendercolor;
+    int renderfx, movetype; float animtime, framerate; int body;
+    unsigned char controller[4], blending[4];
+    float velocity[3], mins[3], maxs[3]; int aiment, owner;
+    float friction, gravity; int team, playerclass, health, spectator;
+    int weaponmodel, gaitsequence; float basevelocity[3];
+    int usehull, oldbuttons, onground, iStepLeft; float flFallVelocity, fov;
+    int weaponanim; float startpos[3], endpos[3], impacttime, starttime;
+    int iuser1, iuser2, iuser3, iuser4; float fuser1, fuser2, fuser3, fuser4;
+    float vuser1[3], vuser2[3], vuser3[3], vuser4[3];
+} sc_entity_state_t;
+/* cl_entity_t: int index; qboolean player; baseline; prevstate; curstate */
+#define SC_ENT_CURSTATE (8 + 2 * sizeof(sc_entity_state_t))
+
+typedef struct { int ambientlight, shadelight; float color[3]; float *plightvec; } sc_alight_t;
+typedef void *(*fn_studio_ptr)(void);
+typedef void *(*fn_studio_get_cvar)(const char *);
+typedef void (*fn_studio_setup_lighting)(sc_alight_t *);
+typedef int (*fn_studio_int)(void);
+static fn_studio_ptr studio_get_current_entity, studio_get_bone_transform,
+    studio_get_light_transform;
+static fn_studio_get_cvar studio_get_cvar;
+static fn_studio_setup_lighting real_studio_setup_lighting;
+static fn_studio_int studio_get_force_face_flags;
+static int studio_bodypart = -1;               /* last StudioSetupModel arg */
+static sc_alight_t studio_light;
+static int studio_fast_enabled = 1;    /* VKSKELETON_STUDIO=0 disables */
+static float light_table[LIGHT_SLOTS]; /* learned engine light values */
+static float studio_out[STUDIO_CAP_MAX][10];  /* our output when validating */
+static int studio_cap_ls[STUDIO_CAP_MAX];     /* its light slots */
+static unsigned char light_known[LIGHT_SLOTS];
+
+/* per-submodel validation state */
+#define SUBMODEL_SLOTS 4096
+static struct { const void *key; int state; int ok; } submodels[SUBMODEL_SLOTS];
+
+static int *submodel_entry(const void *key, int **ok)
+{
+    unsigned h = (unsigned)((uintptr_t)key >> 4) & (SUBMODEL_SLOTS - 1);
+    int n;
+    for (n = 0; n < SUBMODEL_SLOTS; n++, h = (h + 1) & (SUBMODEL_SLOTS - 1)) {
+        if (submodels[h].key == key || !submodels[h].key) {
+            submodels[h].key = key;
+            *ok = &submodels[h].ok;
+            return &submodels[h].state; /* 0 unknown, 1 fast, -1 engine */
+        }
+    }
+    return NULL;
+}
+
+static int rd_i(const unsigned char *p, int off) { int v; memcpy(&v, p + off, 4); return v; }
+
+/* The submodel being drawn, computed like GoldSrc's StudioSetupModel:
+ * index = (curstate.body / base) % nummodels.  The out-parameter of the
+ * client's StudioSetupModel is not the submodel in Sven 5.26 (it pointed
+ * ~900 MB away from the header).  Offsets: see docs/NOTES.md. */
+static const unsigned char *studio_current_submodel(void)
+{
+    const unsigned char *h = studio_hdr, *bp, *ent;
+    int nm, base, mi;
+
+    if (!h || studio_bodypart < 0 || studio_bodypart >= rd_i(h, 204) ||
+        rd_i(h, 208) <= 0 || !studio_get_current_entity)
+        return NULL;
+    bp = h + rd_i(h, 208) + studio_bodypart * 76;
+    nm = rd_i(bp, 64);
+    base = rd_i(bp, 68);
+    mi = rd_i(bp, 72);
+    ent = (const unsigned char *)studio_get_current_entity();
+    if (nm <= 0 || base <= 0 || mi <= 0 || !ent)
+        return NULL;
+    return h + mi + ((((const sc_entity_state_t *)(ent + SC_ENT_CURSTATE))->body
+                      / base) % nm) * 112;
+}
+
+static void vk_StudioSetupModel(int bodypart, void **ppbodypart,
+                                void **ppsubmodel)
+{
+    if (real_studio_setup_model)
+        real_studio_setup_model(bodypart, ppbodypart, ppsubmodel);
+    studio_bodypart = bodypart;
+}
+
+static void vk_StudioSetupLighting(sc_alight_t *plighting)
+{
+    if (plighting)
+        studio_light = *plighting;
+    if (real_studio_setup_lighting)
+        real_studio_setup_lighting(plighting);
+}
+
+/* Our version of the draw, into out[] (x y z u v r g b a slot) when
+ * validating, or straight into the Vulkan batches when out == NULL.
+ * Returns the vertex count, or -1 if this draw must use the engine path. */
+/* ---------- GPU skinning: static submodel geometry ----------
+ * Each (submodel, skin) is expanded once into skin_vb/skin_ib exactly as
+ * studio_draw_fast() would emit it (same strip/fan winding), but in model
+ * space with bone indices; the skinned vertex shader does the rest. */
+typedef struct { uint32_t first, count; } skin_mesh_t;
+typedef struct {
+    const void *sm, *hdr;
+    int skin, numverts;
+    char name[16];          /* submodel name: detects reused addresses */
+    uint32_t mesh0;         /* first entry in skin_meshes[] */
+    int used;
+} skin_model_t;
+#define SKIN_MODELS 4096    /* hash table, power of two */
+#define SKIN_MESHES 65536
+static skin_model_t skin_models[SKIN_MODELS];
+static skin_mesh_t skin_meshes[SKIN_MESHES];
+static uint32_t skin_model_count, skin_mesh_used, skin_vtx_used, skin_idx_used;
+
+/* Buffers full (or many maps' models cached): start over.  Only at the
+ * start of a frame, once nothing in flight can read the old contents. */
+static void skin_cache_reset(void)
+{
+    if (render_thread_enabled)
+        render_thread_wait_idle();
+    if (device)
+        p_vkWaitForFences(device, FRAMES_IN_FLIGHT, frame_fences, VK_TRUE,
+                          UINT64_MAX);
+    completed_serial = frame_serial;
+    memset(skin_models, 0, sizeof(skin_models));
+    skin_model_count = skin_mesh_used = skin_vtx_used = skin_idx_used = 0;
+    skin_reset_pending = 0;
+    logmsg("vkskeleton: GPU skinning cache reset\n");
+}
+
+static const skin_model_t *skin_model_get(const unsigned char *h,
+                                          const unsigned char *sm, int skin,
+                                          const short *skinref, int texidx)
+{
+    uint32_t slot = (uint32_t)(((uintptr_t)sm >> 4) * 2654435761u ^
+                               (uint32_t)skin * 40503u) & (SKIN_MODELS - 1);
+    int numverts = rd_i(sm, 80), numnorms = rd_i(sm, 92), nummesh = rd_i(sm, 72);
+    int numbones = rd_i(h, 140);
+    const unsigned char *mesh0 = h + rd_i(sm, 76);
+    const unsigned char *vbone = h + rd_i(sm, 84), *nbone = h + rd_i(sm, 96);
+    const float *verts = (const float *)(h + rd_i(sm, 88));
+    const float *norms = (const float *)(h + rd_i(sm, 100));
+    skin_vertex_t *vb = (skin_vertex_t *)skin_vb_map;
+    uint32_t *ib = (uint32_t *)skin_ib_map;
+    uint32_t vc = skin_vtx_used, ic = skin_idx_used;
+    skin_model_t *e;
+    int m;
+
+    for (;; slot = (slot + 1) & (SKIN_MODELS - 1)) {
+        e = &skin_models[slot];
+        if (!e->used)
+            break;
+        if (e->sm == sm && e->hdr == h && e->skin == skin &&
+            e->numverts == numverts && !memcmp(e->name, sm, sizeof(e->name)))
+            return e;
+    }
+    if (skin_model_count >= SKIN_MODELS * 3 / 4 ||
+        skin_mesh_used + (uint32_t)nummesh > SKIN_MESHES) {
+        skin_reset_pending = 1;
+        return NULL;
+    }
+    for (m = 0; m < nummesh; m++) {
+        const unsigned char *me = mesh0 + m * 20;
+        const unsigned char *tx = h + texidx + skinref[rd_i(me, 8)] * 80;
+        const short *cmd = (const short *)(h + rd_i(me, 4));
+        float s_scale = 1.0f / (float)rd_i(tx, 68);
+        float t_scale = 1.0f / (float)rd_i(tx, 72);
+        uint32_t fl, first = ic;
+        float flags;
+        int n;
+
+        memcpy(&fl, tx + 64, 4);
+        flags = (fl & STUDIO_NF_FULLBRIGHT) ? 2.0f
+              : (fl & STUDIO_NF_FLATSHADE) ? 1.0f : 0.0f;
+        while ((n = *cmd++) != 0) {
+            int fan = n < 0, j;
+            uint32_t base = vc;
+            if (fan)
+                n = -n;
+            if (vc + (uint32_t)n > SKIN_MAX_VERTICES ||
+                ic + 3u * (uint32_t)n > SKIN_MAX_INDICES) {
+                skin_reset_pending = 1;
+                return NULL;
+            }
+            for (j = 0; j < n; j++, cmd += 4) {
+                int vi = cmd[0], ni = cmd[1];
+                skin_vertex_t *o = &vb[vc++];
+                if (vi < 0 || vi >= numverts || ni < 0 || ni >= numnorms)
+                    return NULL;
+                o->x = verts[vi * 3]; o->y = verts[vi * 3 + 1];
+                o->z = verts[vi * 3 + 2];
+                o->u = cmd[2] * s_scale; o->v = cmd[3] * t_scale;
+                o->nx = norms[ni * 3]; o->ny = norms[ni * 3 + 1];
+                o->nz = norms[ni * 3 + 2];
+                o->bone = (float)(vbone[vi] < STUDIO_MAX_BONES ? vbone[vi] : 0);
+                o->nbone = (float)(nbone[ni] < numbones ? nbone[ni] : 0);
+                o->flags = flags;
+                o->pad = 0.0f;
+                if (j < 2)
+                    continue;
+                /* append_geometry's strip / fan winding */
+                if (fan) {
+                    ib[ic++] = base; ib[ic++] = base + j - 1; ib[ic++] = base + j;
+                } else if ((j & 1) == 0) {
+                    ib[ic++] = base + j - 2; ib[ic++] = base + j - 1;
+                    ib[ic++] = base + j;
+                } else {
+                    ib[ic++] = base + j - 1; ib[ic++] = base + j - 2;
+                    ib[ic++] = base + j;
+                }
+            }
+        }
+        skin_meshes[skin_mesh_used + m].first = first;
+        skin_meshes[skin_mesh_used + m].count = ic - first;
+    }
+    e->sm = sm;
+    e->hdr = h;
+    e->skin = skin;
+    e->numverts = numverts;
+    memcpy(e->name, sm, sizeof(e->name));
+    e->mesh0 = skin_mesh_used;
+    e->used = 1;
+    skin_mesh_used += (uint32_t)nummesh;
+    skin_vtx_used = vc;
+    skin_idx_used = ic;
+    skin_model_count++;
+    return e;
+}
+
+/* The engine's light value per slot; slots not seen yet are interpolated
+ * between learned neighbours (the table is a smooth gamma curve). */
+static void skin_write_lut(float *dst)
+{
+    int i, j, prev = -1;
+
+    for (i = 0; i < LIGHT_SLOTS; i++) {
+        if (!light_known[i])
+            continue;
+        for (j = prev + 1; j < i; j++)
+            dst[j] = prev < 0 ? light_table[i]
+                   : light_table[prev] + (light_table[i] - light_table[prev]) *
+                                             (float)(j - prev) / (float)(i - prev);
+        dst[i] = light_table[i];
+        prev = i;
+    }
+    for (j = prev + 1; j < (int)(SKIN_LUT_BYTES / 4); j++)
+        dst[j] = prev < 0 ? 0.0f : light_table[prev];
+}
+
+/* Draw the current submodel with the skinned shader.  Same inputs as the
+ * CPU fast path after its eligibility checks.  Returns -1 to fall back. */
+static int studio_draw_gpu(const unsigned char *h, const unsigned char *sm,
+                           int skin, const short *skinref, int texidx,
+                           int numbones, float (*bones)[STUDIO_MAX_BONES][3][4],
+                           float (*blight)[3], float lambert)
+{
+    const skin_model_t *e;
+    uint32_t need = ((uint32_t)(4 + numbones * 4) * 16 + skin_ubo_align - 1) &
+                    ~(skin_ubo_align - 1);
+    uint32_t slot_base = cur_frame * SKIN_UBO_SLOT_BYTES, off;
+    const unsigned char *mesh0 = h + rd_i(sm, 76);
+    int nummesh = rd_i(sm, 72), m, i, k, emitted = 0;
+    float *u;
+
+    if (!skin_ready || !geometry_enabled || current_framebuffer != 0 ||
+        !frame_slot_begin())
+        return -1;
+    compute_draw_state();
+    if (ds.replace || ds.tex2)
+        return -1;
+    if (frame_batch_count + (uint32_t)nummesh > MAX_FRAME_BATCHES ||
+        frame_cmd_count + (uint32_t)nummesh > MAX_FRAME_CMDS)
+        return -1;
+    e = skin_model_get(h, sm, skin, skinref, texidx);
+    if (!e || !draw_matrix_ready())
+        return -1;
+    if (!skin_lut_done) {
+        skin_write_lut((float *)((unsigned char *)skin_ubo_map + slot_base));
+        skin_ubo_used = (SKIN_LUT_BYTES + skin_ubo_align - 1) & ~(skin_ubo_align - 1);
+        skin_lut_done = 1;
+    }
+    if (skin_ubo_used + need > SKIN_UBO_SLOT_BYTES)
+        return -1;
+    off = slot_base + skin_ubo_used;
+    skin_ubo_used += need;
+    u = (float *)((unsigned char *)skin_ubo_map + off);
+    u[0] = (float)studio_light.ambientlight;
+    u[1] = (float)studio_light.shadelight;
+    u[2] = lambert;
+    u[3] = 0.0f;
+    for (k = 0; k < 3; k++)
+        u[4 + k] = studio_light.color[k] * ds.scale;
+    u[7] = 1.0f;
+    u[8] = ds.alpha_ref;
+    u[9] = ds.alpha_func;
+    u[10] = u[11] = 0.0f;
+    for (i = 0; i < numbones; i++) {
+        float *r = u + 16 + i * 16;
+        memcpy(r, (*bones)[i], 12 * sizeof(float));
+        r[12] = blight[i][0];
+        r[13] = blight[i][1];
+        r[14] = blight[i][2];
+        r[15] = 0.0f;
+    }
+    for (m = 0; m < nummesh; m++) {
+        const skin_mesh_t *ms = &skin_meshes[e->mesh0 + (uint32_t)m];
+        const unsigned char *tx = h + texidx + skinref[rd_i(mesh0 + m * 20, 8)] * 80;
+        vk_texture_t *vt = get_texture_slot((GLuint)rd_i(tx, 76), 0);
+        frame_batch_t *b;
+
+        if (!ms->count)
+            continue;
+        frame_cmds[frame_cmd_count].type = FCMD_DRAW;
+        frame_cmds[frame_cmd_count].a = frame_batch_count;
+        frame_cmd_count++;
+        b = &frame_batches[frame_batch_count++];
+        b->first = ms->first;
+        b->count = ms->count;
+        b->tex = (vt && vt->desc_set && vt->valid) ? (uint32_t)(vt - vk_textures) : 0;
+        b->tex2 = 0;
+        b->mat = cur_draw_mat;
+        b->pkey = cur_draw_pkey | PKEY_SKIN;
+        b->sref = cur_draw_sref;
+        b->bias_s = cur_draw_bias_s;
+        b->bias_c = cur_draw_bias_c;
+        b->skin_ubo = off;
+        emitted += (int)ms->count;
+    }
+    return emitted;
+}
+
+static int studio_draw_fast(float (*out)[10], unsigned out_max, int gpu)
+{
+    static float xv[STUDIO_MAX_VERTS][3];
+    static int lv_slot[STUDIO_MAX_VERTS];
+    float blight[STUDIO_MAX_BONES][3];
+    const unsigned char *h = studio_hdr, *sm = studio_current_submodel(), *ent;
+    const sc_entity_state_t *cs;
+    float (*bones)[STUDIO_MAX_BONES][3][4];
+    float (*lbones)[STUDIO_MAX_BONES][3][4];
+    const float *lvec;
+    int numverts, numnorms, nummesh, numbones, ntex, texidx, skinidx, nskinref,
+        nfam, skin, m, i, k, emitted = 0, norm_base = 0;
+    float lambert = 1.5f;
+    const unsigned char *vbone, *nbone, *mesh0;
+    const float *verts, *norms;
+    const short *skinref;
+
+    if (!h || !sm || !studio_get_bone_transform || !studio_get_light_transform ||
+        !studio_get_current_entity || !studio_light.plightvec)
+        SF_FAIL(SF_INPUT);
+    if (studio_get_force_face_flags && studio_get_force_face_flags())
+        SF_FAIL(SF_FACEFLAGS);           /* chrome / glow shell passes */
+    ent = (const unsigned char *)studio_get_current_entity();
+    if (!ent)
+        SF_FAIL(SF_ENTITY);
+    cs = (const sc_entity_state_t *)(ent + SC_ENT_CURSTATE);
+    if (cs->rendermode != 0 || cs->renderfx != 0)
+        SF_FAIL(SF_RENDER);              /* transparent / fx entities */
+    ntex = rd_i(h, 180); texidx = rd_i(h, 184);
+    if (ntex <= 0 || texidx <= 0)
+        SF_FAIL(SF_TEXHDR);              /* textures in a separate T.mdl */
+    numbones = rd_i(h, 140);
+    numverts = rd_i(sm, 80); numnorms = rd_i(sm, 92); nummesh = rd_i(sm, 72);
+    if (numbones <= 0 || numbones > STUDIO_MAX_BONES || numverts <= 0 ||
+        numverts > STUDIO_MAX_VERTS || numnorms <= 0 ||
+        numnorms > STUDIO_MAX_VERTS || nummesh <= 0) {
+        static int logged;
+        if (logged++ < 8)
+            logf_msg("vkskeleton: studio sizes: hdr=%.64s bones=%d "
+                     "sub@hdr%+ld name=%.32s mesh=%d verts=%d norms=%d "
+                     "bodypart=%d\n", (const char *)(h + 8), numbones,
+                     (long)(sm - h), (const char *)sm, nummesh, numverts,
+                     numnorms, studio_bodypart);
+        SF_FAIL(SF_SIZES);
+    }
+    skinidx = rd_i(h, 200); nskinref = rd_i(h, 192); nfam = rd_i(h, 196);
+    skinref = (const short *)(h + skinidx);
+    skin = cs->skin;
+    if (skin != 0 && skin < nfam)
+        skinref += skin * nskinref;
+    mesh0 = h + rd_i(sm, 76);
+    /* every mesh texture must be a plain one */
+    for (m = 0; m < nummesh; m++) {
+        int ref = rd_i(mesh0 + m * 20, 8);
+        uint32_t fl;
+        if (ref < 0 || ref >= nskinref || skinref[ref] < 0 || skinref[ref] >= ntex)
+            SF_FAIL(SF_TEXFLAGS);
+        memcpy(&fl, h + texidx + skinref[ref] * 80 + 64, 4);
+        if (fl & (STUDIO_NF_CHROME | STUDIO_NF_ADDITIVE | STUDIO_NF_MASKED |
+                  STUDIO_NF_UV_COORDS))
+            SF_FAIL(SF_TEXFLAGS);
+    }
+
+    bones = (float (*)[STUDIO_MAX_BONES][3][4])studio_get_bone_transform();
+    lbones = (float (*)[STUDIO_MAX_BONES][3][4])studio_get_light_transform();
+    if (!bones || !lbones)
+        SF_FAIL(SF_BONES);
+    if (studio_get_cvar) {
+        const unsigned char *cv = studio_get_cvar("lambert");
+        if (cv)
+            memcpy(&lambert, cv + 12, 4); /* cvar_t.value */
+    }
+    if (lambert <= 1.0f)
+        lambert = 1.0f;
+
+    /* skin vertices */
+    vbone = h + rd_i(sm, 84);
+    verts = (const float *)(h + rd_i(sm, 88));
+    for (i = 0; !gpu && i < numverts; i++) {
+        const float (*b)[4] = (*bones)[vbone[i] < STUDIO_MAX_BONES ? vbone[i] : 0];
+        const float *v = verts + i * 3;
+        for (k = 0; k < 3; k++)
+            xv[i][k] = b[k][0] * v[0] + b[k][1] * v[1] + b[k][2] * v[2] + b[k][3];
+    }
+    /* light vector in each bone's space (VectorIRotate) */
+    lvec = studio_light.plightvec;
+    for (i = 0; i < numbones; i++) {
+        const float (*b)[4] = (*lbones)[i];
+        for (k = 0; k < 3; k++)
+            blight[i][k] = lvec[0] * b[0][k] + lvec[1] * b[1][k] + lvec[2] * b[2][k];
+    }
+    if (gpu)
+        return studio_draw_gpu(h, sm, skin, skinref, texidx, numbones, bones,
+                               blight, lambert);
+    /* light every normal with its mesh's texture flags */
+    nbone = h + rd_i(sm, 96);
+    norms = (const float *)(h + rd_i(sm, 100));
+    for (m = 0; m < nummesh; m++) {
+        const unsigned char *me = mesh0 + m * 20;
+        int nn = rd_i(me, 12), ref = rd_i(me, 8);
+        uint32_t fl;
+        memcpy(&fl, h + texidx + skinref[ref] * 80 + 64, 4);
+        for (i = 0; i < nn && norm_base + i < numnorms; i++) {
+            int j = norm_base + i;
+            if (fl & STUDIO_NF_FULLBRIGHT) {
+                lv_slot[j] = LIGHT_SLOTS - 1;
+                continue;
+            }
+            {
+                float illum = (float)studio_light.ambientlight, lc;
+                if (fl & STUDIO_NF_FLATSHADE) {
+                    illum += studio_light.shadelight * 0.8f;
+                } else {
+                    const float *n = norms + j * 3;
+                    int bi = nbone[j] < numbones ? nbone[j] : 0;
+                    lc = n[0] * blight[bi][0] + n[1] * blight[bi][1] +
+                         n[2] * blight[bi][2];
+                    if (lc > 1.0f)
+                        lc = 1.0f;
+                    illum += studio_light.shadelight;
+                    lc = (lc + (lambert - 1.0f)) / lambert;
+                    if (lc > 0.0f)
+                        illum -= studio_light.shadelight * lc;
+                    if (illum <= 0.0f)
+                        illum = 0.0f;
+                }
+                if (illum > 255.0f)
+                    illum = 255.0f;
+                lv_slot[j] = (int)(illum * 4.0f);
+            }
+        }
+        norm_base += nn;
+    }
+
+    /* emit strips / fans mesh by mesh, in the engine's order */
+    {
+        GLuint saved_tex = unit_texture[0];
+        int saved_en = unit_tex_enabled[0];
+        float saved_color[4], su = cur_u, svv = cur_v;
+        memcpy(saved_color, cur_color, sizeof(saved_color));
+        for (m = 0; m < nummesh; m++) {
+            const unsigned char *me = mesh0 + m * 20;
+            const unsigned char *tx = h + texidx + skinref[rd_i(me, 8)] * 80;
+            const short *cmd = (const short *)(h + rd_i(me, 4));
+            float s_scale = 1.0f / (float)rd_i(tx, 68);
+            float t_scale = 1.0f / (float)rd_i(tx, 72);
+            GLuint gl_id = (GLuint)rd_i(tx, 76);
+            vk_texture_t *vt = get_texture_slot(gl_id, 0);
+            float slot = vt ? (float)(vt - vk_textures) : 0.0f;
+            int n;
+
+            if (!out) {
+                unit_texture[0] = gl_id;
+                unit_tex_enabled[0] = 1;
+                state_serial++;
+            }
+            while ((n = *cmd++) != 0) {
+                GLenum mode = n < 0 ? GL_TRIANGLE_FAN : GL_TRIANGLE_STRIP;
+                if (n < 0)
+                    n = -n;
+                if (!out) {
+                    im_mode = mode;
+                    im_vertex_count = 0;
+                    im_active = 1;
+                    compute_draw_state();
+                }
+                for (; n > 0; n--, cmd += 4) {
+                    int vi = cmd[0], ni = cmd[1], ls;
+                    float lv, c[4];
+                    if (vi < 0 || vi >= numverts || ni < 0 || ni >= numnorms) {
+                        sf_count[SF_TRICMD]++;
+                        goto bad;
+                    }
+                    ls = lv_slot[ni];
+                    if (!light_known[ls]) {
+                        if (!out) {
+                            sf_count[SF_LIGHT]++;
+                            goto bad; /* not learned yet: engine path */
+                        }
+                        lv = 0.0f;
+                    } else {
+                        lv = light_table[ls];
+                    }
+                    for (k = 0; k < 3; k++)
+                        c[k] = lv * studio_light.color[k];
+                    c[3] = 1.0f;
+                    if (out) {
+                        float *o;
+                        if ((unsigned)emitted >= out_max)
+                            goto bad;
+                        o = out[emitted];
+                        o[0] = xv[vi][0]; o[1] = xv[vi][1]; o[2] = xv[vi][2];
+                        o[3] = cmd[2] * s_scale; o[4] = cmd[3] * t_scale;
+                        o[5] = c[0]; o[6] = c[1]; o[7] = c[2]; o[8] = c[3];
+                        o[9] = slot;
+                        studio_cap_ls[emitted] = ls;
+                    } else {
+                        cur_u = cmd[2] * s_scale;
+                        cur_v = cmd[3] * t_scale;
+                        memcpy(cur_color, c, sizeof(c));
+                        push_im_vertex(xv[vi][0], xv[vi][1], xv[vi][2]);
+                    }
+                    emitted++;
+                }
+                if (!out) {
+                    append_geometry();
+                    im_active = 0;
+                    im_vertex_count = 0;
+                }
+            }
+        }
+        if (0) {
+bad:
+            emitted = -1;
+            if (!out) {
+                im_active = 0;
+                im_vertex_count = 0;
+            }
+        }
+        if (!out) {
+            unit_texture[0] = saved_tex;
+            unit_tex_enabled[0] = saved_en;
+            state_serial++;
+            memcpy(cur_color, saved_color, sizeof(saved_color));
+            cur_u = su;
+            cur_v = svv;
+        }
+    }
+    return emitted;
+}
+
+/* Compare the engine's captured output with ours; learn light values. */
+static int studio_validate(int ours)
+{
+    unsigned i;
+    int mc = 0, k;
+
+    if (ours < 0 || (unsigned)ours != studio_cap_n)
+        return 0;
+    for (k = 1; k < 3; k++)
+        if (studio_light.color[k] > studio_light.color[mc])
+            mc = k;
+    for (i = 0; i < studio_cap_n; i++) {
+        const float *e = studio_cap[i], *o = studio_out[i];
+        int ls = studio_cap_ls[i];
+        float lv;
+        for (k = 0; k < 3; k++)
+            if (fabsf(e[k] - o[k]) > 0.05f)
+                return 0;                /* position */
+        if (fabsf(e[3] - o[3]) > 1e-3f || fabsf(e[4] - o[4]) > 1e-3f ||
+            e[9] != o[9] || fabsf(e[8] - 1.0f) > 0.01f)
+            return 0;                    /* uv / texture / alpha */
+        if (studio_light.color[mc] < 0.05f)
+            return 0;
+        lv = e[5 + mc] / studio_light.color[mc];
+        if (light_known[ls] && fabsf(light_table[ls] - lv) > 0.01f) {
+            /* lit differently from the rest (seen: 1.0 = unlit/fullbright
+             * model): only this submodel keeps the engine path */
+            static int logged;
+            if (logged++ < 12)
+                logf_msg("vkskeleton: studio light mismatch: %.64s slot %d: "
+                         "%.3f vs %.3f\n", (const char *)(studio_hdr + 8), ls,
+                         light_table[ls], lv);
+            return 0;
+        }
+        light_table[ls] = lv;
+        light_known[ls] = 1;
+        for (k = 0; k < 3; k++)
+            if (fabsf(e[5 + k] - lv * studio_light.color[k]) > 0.01f)
+                return 0;                /* colour model differs */
+    }
+    return 1;
+}
+
+static void vk_StudioDrawPoints(void)
+{
+    double t0 = now_ns();
+    int *state = NULL, *ok = NULL;
+    const unsigned char *sub = studio_fast_enabled ? studio_current_submodel()
+                                                   : NULL;
+
+    studio_draw_calls++;
+    if (sub && should_skip_gl_draw() &&
+        blend_mode_from_state() == BLEND_OPAQUE)
+        state = submodel_entry(sub, &ok);
+
+    if (!state && studio_fast_enabled)
+        sf_count[!sub ? SF_NOSUB
+                 : !should_skip_gl_draw() ? SF_GLPATH : SF_BLEND]++;
+    if (state && *state == 1) {
+        if (studio_draw_fast(NULL, 0, 1) >= 0) {
+            studio_gpu_calls++;
+            studio_fast_calls++;
+            studio_ns += now_ns() - t0;
+            return;
+        }
+        if (studio_draw_fast(NULL, 0, 0) >= 0) {
+            studio_fast_calls++;
+            studio_ns += now_ns() - t0;
+            return;
+        }
+    } else if (state && *state == 0) {
+        /* validation: the engine draws (and we record it), we compute */
+        studio_cap_n = 0;
+        studio_capture_on = 1;
+        if (real_studio_draw_points)
+            real_studio_draw_points();
+        studio_capture_on = 0;
+        {
+            static int logged_fast, logged_slow;
+            int ours = studio_draw_fast(studio_out, STUDIO_CAP_MAX, 0);
+            if (studio_validate(ours)) {
+                if (++*ok >= STUDIO_VALIDATE_DRAWS) {
+                    *state = 1;
+                    if (logged_fast++ < 12)
+                        logf_msg("vkskeleton: studio fast path: %.64s "
+                                 "(%.64s)\n", (const char *)(studio_hdr + 8),
+                                 (const char *)sub);
+                }
+            } else if (studio_fast_enabled && ours >= 0) {
+                /* ours < 0: not eligible this draw (fx, blend...): retry later */
+                *state = -1; /* real mismatch: this submodel keeps the engine path */
+                if (logged_slow++ < 12)
+                    logf_msg("vkskeleton: studio engine path: %.64s (%.64s) "
+                             "ours=%d engine=%u verts\n",
+                             (const char *)(studio_hdr + 8),
+                             (const char *)sub, ours, studio_cap_n);
+            }
+        }
+        studio_ns += now_ns() - t0;
+        return;
+    }
+    if (real_studio_draw_points)
+        real_studio_draw_points();
+    studio_ns += now_ns() - t0;
+}
+
+static int vk_HUD_GetStudioModelInterface(int version, void **ppinterface,
+                                          void **pstudio)
+{
+    if (pstudio && version == STUDIO_INTERFACE_VERSION) {
+        real_studio_setup_model =
+            (fn_studio_setup_model)pstudio[ESA_STUDIO_SETUP_MODEL];
+        real_studio_draw_points = (fn_studio_void)pstudio[ESA_STUDIO_DRAW_POINTS];
+        real_studio_set_header =
+            (fn_studio_set_header)pstudio[ESA_STUDIO_SET_HEADER];
+        studio_get_current_entity = (fn_studio_ptr)pstudio[ESA_GET_CURRENT_ENTITY];
+        studio_get_cvar = (fn_studio_get_cvar)pstudio[ESA_GET_CVAR];
+        studio_get_bone_transform = (fn_studio_ptr)pstudio[ESA_GET_BONE_TRANSFORM];
+        studio_get_light_transform = (fn_studio_ptr)pstudio[ESA_GET_LIGHT_TRANSFORM];
+        studio_get_force_face_flags =
+            (fn_studio_int)pstudio[ESA_GET_FORCE_FACE_FLAGS];
+        real_studio_setup_lighting =
+            (fn_studio_setup_lighting)pstudio[ESA_STUDIO_SETUP_LIGHTING];
+        pstudio[ESA_STUDIO_SETUP_LIGHTING] = (void *)vk_StudioSetupLighting;
+        pstudio[ESA_STUDIO_SETUP_MODEL] = (void *)vk_StudioSetupModel;
+        pstudio[ESA_STUDIO_DRAW_POINTS] = (void *)vk_StudioDrawPoints;
+        pstudio[ESA_STUDIO_SET_HEADER] = (void *)vk_StudioSetHeader;
+        logf_msg("vkskeleton: studio interface hooked (version %d)\n", version);
+    } else {
+        logf_msg("vkskeleton: studio interface NOT hooked (version %d)\n",
+                 version);
+    }
+    return real_hud_get_studio_iface
+               ? real_hud_get_studio_iface(version, ppinterface, pstudio)
+               : 0;
+}
+
 static void *substitute(const char *symbol, void *result)
 {
     if (!enabled || !symbol || !result)
@@ -5515,13 +6655,15 @@ static void *substitute(const char *symbol, void *result)
     if (!strcmp(symbol, "glClearColor")) return (void *)glClearColor;
     if (!strcmp(symbol, "SDL_GL_SwapWindow")) return (void *)SDL_GL_SwapWindow;
     if (!strcmp(symbol, "V_CalcRefdef")) { /* client.so view hook: freecam */
-        if (!real_v_calcrefdef)
-            real_v_calcrefdef = (fn_v_calcrefdef)result;
+        real_v_calcrefdef = (fn_v_calcrefdef)result; /* client.so reloads on video restart */
         return (void *)vk_V_CalcRefdef;
     }
+    if (!strcmp(symbol, "HUD_GetStudioModelInterface")) {
+        real_hud_get_studio_iface = (fn_hud_get_studio_iface)result; /* client.so reloads on video restart */
+        return (void *)vk_HUD_GetStudioModelInterface;
+    }
     if (!strcmp(symbol, "CL_CreateMove")) { /* freeze player in freecam */
-        if (!real_cl_createmove)
-            real_cl_createmove = (fn_cl_createmove)result;
+        real_cl_createmove = (fn_cl_createmove)result; /* client.so reloads on video restart */
         return (void *)vk_CL_CreateMove;
     }
     if (vkx_client_symbol) {
@@ -5680,8 +6822,10 @@ __attribute__((constructor)) static void vkskeleton_init(void)
 
     e = getenv("VKSKELETON_ENABLE");
     enabled = e && *e && strcmp(e, "0");
+    e = getenv("VKSKELETON_STUDIO");
+    studio_fast_enabled = !(e && !strcmp(e, "0"));
     e = getenv("VKSKELETON_RENDER_THREAD");
-    render_thread_enabled = e && *e && strcmp(e, "0");
+    render_thread_enabled = !(e && !strcmp(e, "0")); /* on unless =0 */
     e = getenv("VKSKELETON_GL_PASSTHROUGH");
     skip_gl_draws = !(e && *e && strcmp(e, "0"));
     e = getenv("VKSKELETON_DEBUG");
